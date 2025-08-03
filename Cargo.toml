@@ -1,0 +1,23 @@
+[package]
+name = "castbox"
+version = "0.1.0"
+authors = ["Andrea Frolli dev.sh1zen@outlook.it"]
+edition = "2024"
+description = "A Runtime-Typed Reference-Counted Smart Pointer and Concurrent Programming tools."
+license = "Apache-2.0"
+repository = "https://github.com/sh1zen/castbox"
+documentation = "https://docs.rs/castbox"
+readme = "README.md"
+keywords = ["runtime-typed", "dynamic-cast", "thread-safe", "reference-counted", "dyn-any"]
+categories = ["data-structures", "memory-management", "development-tools"]
+exclude = [".gitignore", ".github/*"]
+homepage = "https://github.com/sh1zen/castbox"
+
+[dependencies]
+crossync = "0.0.1"
+
+[lib]
+name = "castbox"
+path = "src/lib.rs"
+
+
