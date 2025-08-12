@@ -1,10 +1,11 @@
-use crate::Mutex;
+use crate::mutex::Mutex;
 use std::ops::{Deref, DerefMut};
 
 /// used as wrapper for a pointer to a reference
 #[must_use = "if unused the Mutex will immediately unlock"]
 #[clippy::has_significant_drop]
-pub struct WatchGuard<'a, T: ?Sized + 'a> {
+#[derive(Debug)]
+pub struct WatchGuard<'a, T: ?Sized> {
     data: &'a mut T,
     lock: Mutex,
 }

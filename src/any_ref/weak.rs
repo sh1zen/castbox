@@ -14,6 +14,7 @@ use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct WeakAnyRef {
     pub(crate) ptr: NonNull<AnyRefInner>,
 }

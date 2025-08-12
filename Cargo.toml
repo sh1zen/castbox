@@ -1,6 +1,6 @@
 [package]
 name = "castbox"
-version = "0.0.3"
+version = "0.0.4"
 authors = ["sh1zen dev.sh1zen@outlook.it"]
 edition = "2024"
 description = "A Runtime-Typed Reference-Counted Smart Pointer"
@@ -20,3 +20,6 @@ path = "src/lib.rs"
 [[example]]
 name = "thread_safe"
 path = "examples/thread_safe.rs"
+
+[dependencies]
+crossbeam-queue = "0.3.12"

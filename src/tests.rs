@@ -4,9 +4,9 @@ mod tests {
     use crate::{AnyRef, Downcast, WeakAnyRef};
     use std::any::TypeId;
     use std::rc::Rc;
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     #[test]
@@ -19,7 +19,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
+    //#[cfg_attr(miri, ignore)]
     fn test_send() {
         let a = AnyRef::new(Rc::new("hello".to_string()));
 
@@ -35,17 +35,12 @@ mod tests {
             let mut val_clone = val.clone();
 
             handles.push(thread::spawn(move || {
-                let _clone2 = val_clone.clone();
-
                 let rc = val_clone.downcast_mut::<Rc<String>>();
+                // add some dirty
                 let mut rc = std::hint::black_box(rc);
-
-                for _ in 0..1000 {
-                    let mut_ref = Rc::get_mut(&mut *rc);
-
-                    if let Some(s) = mut_ref {
-                        s.push_str(":1");
-                    }
+                for _ in 0..100 {
+                    let ptr = Rc::get_mut(&mut rc).unwrap();
+                    ptr.push_str(":1")
                 }
             }));
         }
@@ -54,7 +49,36 @@ mod tests {
             h.join().unwrap();
         }
 
-        assert_eq!(val.downcast_ref::<Rc<String>>().split(":").count(), 100_001);
+        assert_eq!(val.downcast_ref::<Rc<String>>().split(":").count(), 10_001);
+    }
+
+    #[test]
+    fn test_arc_send() {
+        let a = Arc::new(std::sync::Mutex::new("hello".to_string()));
+
+        let mut handles = vec![];
+
+        let val = Arc::clone(&a);
+
+        for _ in 0..100 {
+            let val_clone = val.clone();
+
+            handles.push(thread::spawn(move || {
+                let rc = val_clone.clone();
+                // add some dirty
+                let rc = std::hint::black_box(rc);
+                for _ in 0..100 {
+                    let mut ptr = rc.lock().unwrap();
+                    ptr.push_str(":1")
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(val.lock().unwrap().split(":").count(), 10_001);
     }
 
     #[test]
@@ -321,6 +345,11 @@ mod tests {
 
         let x = AnyRef::new(4);
         let _y = AnyRef::clone(&x);
-        assert_eq!(*AnyRef::try_unwrap::<i32>(x).unwrap_err().downcast_ref::<i32>(), 4);
+        assert_eq!(
+            *AnyRef::try_unwrap::<i32>(x)
+                .unwrap_err()
+                .downcast_ref::<i32>(),
+            4
+        );
     }
 }

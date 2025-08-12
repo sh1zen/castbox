@@ -1,14 +1,14 @@
-use crate::mutex::mutex::Mutex;
+use crate::mutex::Mutex;
 use std::any::{Any, TypeId};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Acquire;
 
 /// Max number of reference that an any_ref could have
-pub const MAX_REFCOUNT: usize = isize::MAX as usize;
+pub(super) const MAX_REFCOUNT: usize = isize::MAX as usize;
 
 /// Actually the main worker of AnyRef
 #[repr(C)]
-pub struct AnyRefInner {
+pub(crate) struct AnyRefInner {
     pub(crate) data: Box<dyn Any>,
     pub(crate) type_id: TypeId,
     pub(crate) type_name: &'static str,

@@ -1,18 +1,18 @@
-use std::alloc::{dealloc, Layout};
-
+use crossbeam_queue::SegQueue;
 use std::ptr::NonNull;
 use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::thread;
+use std::thread::Thread;
 use std::time::{Duration, Instant};
 
 /// A fast user space thread locker
 /// ```
-/// use crate::castbox::Mutex;
 /// use std::time::Duration;
 /// use std::thread::sleep;
 /// use std::thread;
+/// use castbox::Mutex;
 ///
 /// let mutex = Mutex::new();
 ///
@@ -37,15 +37,22 @@ use std::time::{Duration, Instant};
 ///```
 type State = u8;
 
+const ALLOW_PARKING: bool = true;
+
 const UNLOCKED: State = 0;
 const LOCKED: State = 1; // locked, no other threads waiting
 const CONTENDED: State = 2; // locked, and other threads waiting (contended)
 
+#[repr(C)]
+#[derive(Debug)]
 struct InnerMutex {
     state: AtomicU8,
     ref_count: AtomicUsize,
+    parked: SegQueue<Thread>,
 }
 
+#[repr(transparent)]
+#[derive(Debug)]
 pub struct Mutex {
     ptr: NonNull<InnerMutex>,
 }
@@ -58,6 +65,7 @@ impl Mutex {
         let ptr = Box::into_raw(Box::new(InnerMutex {
             state: AtomicU8::new(UNLOCKED),
             ref_count: AtomicUsize::new(1),
+            parked: SegQueue::new(),
         }));
         Self {
             ptr: NonNull::new(ptr).expect("Happened an invalid allocation for Mutex"),
@@ -94,7 +102,6 @@ impl Mutex {
         self.inner().state.load(Relaxed) != UNLOCKED
     }
 
-    #[cold]
     fn lock_contended(&self) {
         // Spin first to speed things up if the lock is released quickly.
         let mut state = self.spin(100);
@@ -122,14 +129,13 @@ impl Mutex {
             }
 
             // Wait for the futex to change state, assuming it is still CONTENDED.
-            us_wait(&self.inner().state, CONTENDED, None);
+            self.us_wait(&self.inner().state, CONTENDED, None);
 
             // Spin again after waking up.
             state = self.spin(100);
         }
     }
 
-    #[cold]
     fn spin(&self, mut spin: i32) -> State {
         loop {
             // We only use `load` (and not `swap` or `compare_exchange`)
@@ -149,7 +155,7 @@ impl Mutex {
 
     #[inline]
     pub fn unlock(&self) {
-        if self.inner().state.swap(UNLOCKED, Release) == CONTENDED {
+        if self.inner().state.swap(UNLOCKED, Release) == CONTENDED && ALLOW_PARKING {
             // We only wake up one thread. When that thread locks the mutex, it
             // will mark the mutex as CONTENDED (see lock_contended above),
             // which makes sure that any other waiting threads will also be
@@ -158,44 +164,60 @@ impl Mutex {
         }
     }
 
-    #[cold]
+    #[inline(always)]
+    fn suspend(&self) {
+        unsafe {
+            self.ptr.as_ref().parked.push(thread::current());
+        };
+        thread::park()
+    }
+
     #[inline(always)]
     fn wake(&self) {
-        //...
+        let thread = unsafe { &self.ptr.as_ref().parked };
+        if let Some(thread) = thread.pop() {
+            thread.unpark();
+        }
     }
-}
 
-fn us_wait(state: &AtomicU8, expected: u8, timeout: Option<Duration>) {
-    let mut backoff = 1;
+    fn us_wait(&self, state: &AtomicU8, expected: u8, timeout: Option<Duration>) {
+        let mut backoff = 1;
 
-    if let Some(max_dur) = timeout {
-        let start = Instant::now();
+        if let Some(max_dur) = timeout {
+            let start = Instant::now();
 
-        while state.load(Acquire) == expected {
-            if start.elapsed() >= max_dur {
-                break;
+            while state.load(Acquire) == expected {
+                if start.elapsed() >= max_dur {
+                    break;
+                }
+                backoff = self.cpu_relax(backoff, false);
             }
-            backoff = cpu_relax(backoff);
-        }
-    } else {
-        while state.load(Acquire) == expected {
-            backoff = cpu_relax(backoff);
+        } else {
+            while state.load(Acquire) == expected {
+                backoff = self.cpu_relax(backoff, ALLOW_PARKING);
+            }
         }
     }
-}
 
-#[inline(always)]
-fn cpu_relax(backoff: i32) -> i32 {
-    // Yield processor or backoff
-    if backoff <= 64 {
-        std::hint::spin_loop();
-    } else if backoff <= 512 {
-        thread::yield_now();
-    } else {
-        thread::sleep(Duration::from_micros(backoff as u64));
+    #[inline(always)]
+    fn cpu_relax(&self, backoff: i32, park: bool) -> i32 {
+        if backoff <= 64 {
+            std::hint::spin_loop();
+        } else {
+            if park {
+                self.suspend();
+                return 1;
+            } else {
+                if backoff <= 512 {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(Duration::from_micros(backoff as u64));
+                }
+            }
+        }
+
+        (backoff * 2).min(10_000)
     }
-
-    (backoff * 2).min(10_000)
 }
 
 impl Clone for Mutex {
@@ -212,10 +234,8 @@ impl Drop for Mutex {
         if self.inner().ref_count.fetch_sub(1, Release) == 1 {
             atomic::fence(Release);
 
-            let layout = Layout::new::<InnerMutex>();
-            let ptr = self.ptr.as_ptr() as *mut u8;
             unsafe {
-                dealloc(ptr, layout);
+                drop(Box::from_raw(self.ptr.as_ptr()));
             }
         }
     }

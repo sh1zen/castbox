@@ -1,5 +1,7 @@
-pub mod mutex;
-pub use mutex::Mutex;
+mod mutex;
+pub use mutex::*;
 
-pub mod watch_guard;
+mod watch_guard;
+mod atomic_vec;
+
 pub use watch_guard::*;
