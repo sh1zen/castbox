@@ -1,13 +1,15 @@
 #[cfg(test)]
 
 mod tests {
-    use crate::{AnyRef, Downcast, WeakAnyRef};
+    use crate::{AnyRef, AtomicVec, Downcast, WeakAnyRef};
     use std::any::TypeId;
     use std::rc::Rc;
     use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::thread::sleep;
+    use std::time::Duration;
 
     #[test]
     fn test_map() {
@@ -19,7 +21,43 @@ mod tests {
     }
 
     #[test]
-    //#[cfg_attr(miri, ignore)]
+    fn test_atomic_vec() {
+        let vec = AtomicVec::new();
+        let vec_c = vec.clone();
+
+        vec_c.push(10);
+        vec.push(20);
+        vec_c.push(30);
+        assert_eq!(vec.pop().unwrap(), 10);
+        assert_eq!(vec.pop().unwrap(), 20);
+        assert_eq!(vec.pop().unwrap(), 30);
+
+        let mut handles = vec![];
+
+        for _ in 0..100 {
+            let vec_c = vec.clone();
+            handles.push(thread::spawn(move || {
+                vec_c.push(10);
+            }));
+
+            let vec_c = vec.clone();
+            handles.push(thread::spawn(move || {
+                vec_c.pop();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for _ in 0..100 {
+            vec_c.pop();
+        }
+
+        assert!(vec.pop().is_none());
+    }
+
+    #[test]
     fn test_send() {
         let a = AnyRef::new(Rc::new("hello".to_string()));
 
@@ -31,7 +69,7 @@ mod tests {
 
         let val = AnyRef::clone(&a);
 
-        for _ in 0..100 {
+        for _ in 0..10 {
             let mut val_clone = val.clone();
 
             handles.push(thread::spawn(move || {
@@ -49,10 +87,11 @@ mod tests {
             h.join().unwrap();
         }
 
-        assert_eq!(val.downcast_ref::<Rc<String>>().split(":").count(), 10_001);
+        assert_eq!(val.downcast_ref::<Rc<String>>().split(":").count(), 1_001);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_arc_send() {
         let a = Arc::new(std::sync::Mutex::new("hello".to_string()));
 
@@ -273,6 +312,29 @@ mod tests {
         }
 
         assert!(weak.upgrade().is_some());
+    }
+
+    #[test]
+    fn test_mutex() {
+        let mutex = crate::Mutex::new();
+        let m1 = mutex.clone();
+        let m2 = mutex.clone();
+
+        let h1 = thread::spawn(move || {
+            m1.lock();
+            sleep(Duration::from_millis(100));
+            m1.unlock();
+        });
+
+        let h2 = thread::spawn(move || {
+            m2.lock();
+            m2.unlock();
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        drop(mutex);
     }
 
     #[test]

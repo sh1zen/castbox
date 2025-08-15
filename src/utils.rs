@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 use std::ptr;
 
 /// Calculate layout for `T` using the inner value's layout
@@ -29,7 +29,7 @@ pub fn create_raw_pointer<T>(s: T) -> *mut T {
 }
 
 #[inline]
-pub fn dealloc_layout<T>(raw: *mut T ) {
+pub fn dealloc_layout<T>(raw: *mut T) {
     unsafe {
         dealloc(raw as *mut u8, Layout::new::<T>());
     }

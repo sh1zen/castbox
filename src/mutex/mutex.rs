@@ -1,11 +1,12 @@
-use crossbeam_queue::SegQueue;
+use crate::AtomicVec;
+use crate::mutex::backoff::Backoff;
 use std::ptr::NonNull;
 use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::thread;
 use std::thread::Thread;
-use std::time::{Duration, Instant};
+use crossbeam_queue::SegQueue;
 
 /// A fast user space thread locker
 /// ```
@@ -72,17 +73,13 @@ impl Mutex {
         }
     }
 
-    #[inline]
-    fn inner(&self) -> &InnerMutex {
-        unsafe { &*self.ptr.as_ptr() }
+    pub fn get_ref_count(&self) -> usize {
+        unsafe { (*self.ptr.as_ptr()).ref_count.load(Acquire) }
     }
 
     #[inline]
-    pub fn try_lock(&self) -> bool {
-        self.inner()
-            .state
-            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
-            .is_ok()
+    fn inner(&self) -> &InnerMutex {
+        unsafe { &*self.ptr.as_ptr() }
     }
 
     #[inline]
@@ -119,6 +116,8 @@ impl Mutex {
             }
         }
 
+        let backoff = Backoff::new();
+
         loop {
             // Put the lock in contended state.
             // We avoid an unnecessary write if it as already set to CONTENDED,
@@ -129,7 +128,13 @@ impl Mutex {
             }
 
             // Wait for the futex to change state, assuming it is still CONTENDED.
-            self.us_wait(&self.inner().state, CONTENDED, None);
+            while self.inner().state.load(Acquire) == CONTENDED {
+                if ALLOW_PARKING && backoff.is_completed() {
+                    self.suspend();
+                } else {
+                    backoff.snooze();
+                }
+            }
 
             // Spin again after waking up.
             state = self.spin(100);
@@ -169,6 +174,7 @@ impl Mutex {
         unsafe {
             self.ptr.as_ref().parked.push(thread::current());
         };
+
         thread::park()
     }
 
@@ -178,45 +184,6 @@ impl Mutex {
         if let Some(thread) = thread.pop() {
             thread.unpark();
         }
-    }
-
-    fn us_wait(&self, state: &AtomicU8, expected: u8, timeout: Option<Duration>) {
-        let mut backoff = 1;
-
-        if let Some(max_dur) = timeout {
-            let start = Instant::now();
-
-            while state.load(Acquire) == expected {
-                if start.elapsed() >= max_dur {
-                    break;
-                }
-                backoff = self.cpu_relax(backoff, false);
-            }
-        } else {
-            while state.load(Acquire) == expected {
-                backoff = self.cpu_relax(backoff, ALLOW_PARKING);
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn cpu_relax(&self, backoff: i32, park: bool) -> i32 {
-        if backoff <= 64 {
-            std::hint::spin_loop();
-        } else {
-            if park {
-                self.suspend();
-                return 1;
-            } else {
-                if backoff <= 512 {
-                    thread::yield_now();
-                } else {
-                    thread::sleep(Duration::from_micros(backoff as u64));
-                }
-            }
-        }
-
-        (backoff * 2).min(10_000)
     }
 }
 

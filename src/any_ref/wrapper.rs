@@ -514,7 +514,12 @@ impl<T: 'static> From<Box<T>> for AnyRef {
 
 impl fmt::Debug for AnyRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&format!("AnyRef::<{}>", self.inner().type_name))
+        let inner = self.inner();
+        f.debug_struct("AnyRef")
+            .field("type", &inner.type_name)
+            .field("S", &inner.strong)
+            .field("W", &inner.weak)
+            .finish()
     }
 }
 
