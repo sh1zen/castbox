@@ -20,5 +20,6 @@ path = "src/lib.rs"
 [[example]]
 name = "thread_safe"
 path = "examples/thread_safe.rs"
+
 [dependencies]
 crossbeam-queue = "0.3.12"

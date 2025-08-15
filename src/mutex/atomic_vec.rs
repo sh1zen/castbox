@@ -1,5 +1,6 @@
 use crate::mutex::backoff::Backoff;
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::{NonNull, null_mut};
 use std::sync::atomic;
@@ -65,11 +66,9 @@ impl<T> AtomicVec<T> {
         let backoff = Backoff::new();
         let block = Block::new(val);
 
-        let mut tail;
         loop {
             self.lock();
-
-            tail = atomic_vec.tail.load(Ordering::Acquire);
+            let tail = atomic_vec.tail.load(Ordering::Acquire);
 
             // update the tail
             match atomic_vec.tail.compare_exchange(
@@ -79,6 +78,12 @@ impl<T> AtomicVec<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
+                    if !tail.is_null() {
+                        unsafe {
+                            (*tail).next.store(block, Ordering::Release);
+                        }
+                    }
+                    self.release();
                     break;
                 }
                 Err(_) => {
@@ -87,17 +92,6 @@ impl<T> AtomicVec<T> {
                 }
             }
         }
-
-        if !tail.is_null() {
-            let tail_block = unsafe { &*tail };
-            let _ = tail_block.next.compare_exchange(
-                null_mut(),
-                block,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
-        }
-        self.release();
 
         // if the head is pointing to null we need to link it.
         let _ = atomic_vec.head.compare_exchange(
@@ -111,25 +105,22 @@ impl<T> AtomicVec<T> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        if self.is_empty() {
-            return None;
-        }
         let atomic_vec = self.inner();
 
         self.lock();
 
         let head = atomic_vec.head.load(Ordering::Acquire);
-        let tail = atomic_vec.tail.load(Ordering::Relaxed);
+
+        if head.is_null() {
+            self.release();
+            return None;
+        }
+
+        let tail = atomic_vec.tail.load(Ordering::Acquire);
 
         if head == tail {
-            // set the tail to nullptr if tail and head are pointing to teh same block
-            // we just need a compare_exchange due to a possible another push written
-            let _ = atomic_vec.tail.compare_exchange(
-                tail,
-                null_mut(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
+            // set the tail to nullptr if tail and head are pointing to the same block
+            atomic_vec.tail.store(null_mut(), Ordering::Release);
         }
 
         let next_block = unsafe { (&*head).next.load(Ordering::Acquire) };
@@ -138,10 +129,10 @@ impl<T> AtomicVec<T> {
 
         atomic_vec.len.fetch_sub(1, Ordering::Release);
 
-        let data = unsafe { ptr::read(&(&*head).value) };
+        let value = unsafe { ManuallyDrop::into_inner(ptr::read(&(*head).value)) };
         unsafe { drop(Box::from_raw(head)) };
 
-        Some(data)
+        Some(value)
     }
 
     #[inline]
@@ -176,7 +167,7 @@ impl<T> AtomicVec<T> {
 /// A block in a linked list.
 struct Block<T> {
     /// The value.
-    value: T,
+    value: ManuallyDrop<T>,
 
     /// The next block in the linked list.
     next: AtomicPtr<Block<T>>,
@@ -185,7 +176,7 @@ struct Block<T> {
 impl<T> Block<T> {
     fn new<'a>(val: T) -> *mut Block<T> {
         Box::into_raw(Box::new(Block {
-            value: val,
+            value: ManuallyDrop::new(val),
             next: AtomicPtr::new(null_mut()),
         }))
     }

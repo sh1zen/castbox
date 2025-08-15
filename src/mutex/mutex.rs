@@ -49,7 +49,7 @@ const CONTENDED: State = 2; // locked, and other threads waiting (contended)
 struct InnerMutex {
     state: AtomicU8,
     ref_count: AtomicUsize,
-    parked: SegQueue<Thread>,
+    parked: AtomicVec<Thread>,
 }
 
 #[repr(transparent)]
@@ -66,7 +66,7 @@ impl Mutex {
         let ptr = Box::into_raw(Box::new(InnerMutex {
             state: AtomicU8::new(UNLOCKED),
             ref_count: AtomicUsize::new(1),
-            parked: SegQueue::new(),
+            parked: AtomicVec::new(),
         }));
         Self {
             ptr: NonNull::new(ptr).expect("Happened an invalid allocation for Mutex"),
