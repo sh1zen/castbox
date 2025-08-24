@@ -21,15 +21,15 @@ impl<T> WatchGuard<T> {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lock.is_locked()
+        self.lock.is_locked_exclusive()
     }
 
     pub fn lock(&self) {
-        self.lock.lock();
+        self.lock.lock_exclusive();
     }
 
     pub fn unlock(&self) {
-        self.lock.unlock();
+        self.lock.unlock_exclusive();
     }
 }
 

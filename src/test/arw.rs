@@ -1,13 +1,15 @@
 mod tests_arw {
     use crate::mutex::WatchGuardRef;
     use crate::{Arw, WeakArw};
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    use std::thread;
+    use std::sync::Barrier;
+    use std::time::Instant;
+    use std::{hint, thread};
 
     #[test]
     fn stress_test() {
+        let started = Instant::now();
         let a = Arw::new("hello".to_string());
 
         assert!(Arw::is_unique(&a));
@@ -20,9 +22,8 @@ mod tests_arw {
             let val_clone = val.clone();
 
             handles.push(thread::spawn(move || {
-                let rc = val_clone.as_mut();
+                let mut rc = val_clone.as_mut();
                 // add some dirty
-                let mut rc = std::hint::black_box(rc);
                 for _ in 0..100 {
                     rc.push_str(":1")
                 }
@@ -34,7 +35,7 @@ mod tests_arw {
             handles.push(thread::spawn(move || {
                 for _ in 0..100 {
                     let _clone = val_clone.as_ref();
-                    let _ = std::hint::black_box(&_clone);
+                    let _u = hint::black_box(_clone);
                 }
             }));
         }
@@ -44,6 +45,7 @@ mod tests_arw {
         }
 
         assert_eq!(val.as_ref().split(":").count(), 10_001);
+        println!("{:?}", started.elapsed());
     }
 
     #[test]

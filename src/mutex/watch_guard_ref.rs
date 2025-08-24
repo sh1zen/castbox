@@ -16,7 +16,7 @@ impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lock.is_locked()
+        self.lock.is_locked_exclusive()
     }
 }
 

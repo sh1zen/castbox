@@ -1,11 +1,12 @@
-use crate::arw::WeakArw;
 use crate::arw::inner::{ArwInner, MAX_REFCOUNT};
 use crate::arw::ptr_interface::PtrInterface;
+use crate::arw::WeakArw;
 use crate::mutex::{WatchGuardMut, WatchGuardRef};
 use crate::utils::is_dangling;
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::process::abort;
 use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -19,6 +20,8 @@ pub struct Arw<T: Sized> {
 unsafe impl<T: Sized + Sync + Send> Send for Arw<T> {}
 unsafe impl<T: Sized + Sync + Send> Sync for Arw<T> {}
 
+impl<T: Sized> UnwindSafe for Arw<T> {}
+impl<T: Sized> RefUnwindSafe for Arw<T> {}
 impl<T> Arw<T> {
     /// Creates a new `Arw` containing the given value.
     ///
@@ -45,14 +48,14 @@ impl<T> Arw<T> {
     /// assert_eq!(value, 123i32);
     /// ```
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        this.inner().lock.lock();
+        this.inner().lock.lock_exclusive();
         if this
             .inner()
             .strong
-            .compare_exchange(1, 0, Relaxed, Relaxed)
+            .compare_exchange(1, 0, Acquire, Relaxed)
             .is_err()
         {
-            this.inner().lock.unlock();
+            this.inner().lock.unlock_exclusive();
             return Err(this);
         }
 
@@ -83,7 +86,7 @@ impl<T> Arw<T> {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.inner().lock.is_locked()
+        self.inner().lock.is_locked_exclusive()
     }
 
     #[inline]
@@ -103,7 +106,7 @@ impl<T> Arw<T> {
     /// use castbox::Arw;
     /// let a = Arw::new(3.14f32);
     /// let f = a.as_ref();
-    /// assert_eq!(*f, 3.14);
+    /// assert_eq!(*f, 3.14f32);
     /// ```
     pub fn as_ref(&self) -> WatchGuardRef<'_, T> {
         let lock = self.inner().lock.clone();
@@ -127,7 +130,7 @@ impl<T> Arw<T> {
     /// ```
     pub fn as_mut(&self) -> WatchGuardMut<'_, T> {
         let lock = self.inner().lock.clone();
-        lock.lock();
+        lock.lock_exclusive();
 
         WatchGuardMut::new(self.inner().get_mut_ref(), lock)
     }
@@ -294,7 +297,7 @@ impl<T> Clone for Arw<T> {
         // Using a relaxed ordering is alright here, as knowledge of the
         // original reference prevents other threads from erroneously deleting
         // the object.
-        if self.inner().strong.fetch_add(1, Relaxed) > MAX_REFCOUNT {
+        if self.inner().strong.fetch_add(1, Relaxed) >= MAX_REFCOUNT {
             abort();
         }
 
@@ -325,9 +328,9 @@ impl<T: Sized> Arw<T> {
     /// ```
     pub fn fill(this: Self, value: T) -> Self {
         let ref_inner = &mut *this.inner_mut();
-        ref_inner.lock.lock();
+        ref_inner.lock.lock_exclusive();
         ref_inner.val = UnsafeCell::new(value);
-        ref_inner.lock.unlock();
+        ref_inner.lock.unlock_exclusive();
         this
     }
 }
@@ -344,7 +347,7 @@ where
             return;
         }
 
-        atomic::fence(Release);
+        atomic::fence(Acquire);
 
         let _weak = WeakArw { ptr: self.ptr };
 
@@ -420,7 +423,7 @@ impl<T> fmt::Debug for Arw<T> {
         f.debug_struct("Arw")
             .field("S", &inner.strong)
             .field("W", &inner.weak)
-            .field("locked", &inner.lock.is_locked())
+            .field("locked", &inner.lock.is_locked_exclusive())
             .finish()
     }
 }

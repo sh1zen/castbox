@@ -1,6 +1,6 @@
 [package]
 name = "castbox"
-version = "0.0.8"
+version = "0.0.9"
 authors = ["sh1zen dev.sh1zen@outlook.it"]
 edition = "2024"
 description = "A Runtime-Typed Reference-Counted Smart Pointer and concurrent programming tools."

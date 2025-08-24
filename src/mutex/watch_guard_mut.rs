@@ -16,7 +16,7 @@ impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lock.is_locked()
+        self.lock.is_locked_exclusive()
     }
 }
 
@@ -41,7 +41,7 @@ impl<T: ?Sized> DerefMut for WatchGuardMut<'_, T> {
 impl<T: ?Sized> Drop for WatchGuardMut<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.unlock();
+        self.lock.unlock_exclusive();
     }
 }
 

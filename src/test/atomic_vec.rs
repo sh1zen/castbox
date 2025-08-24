@@ -1,4 +1,4 @@
-mod test_atomic_vec {
+mod tests_atomic_vec {
     use std::sync::{Arc, Barrier};
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
     use std::thread;

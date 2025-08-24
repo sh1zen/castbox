@@ -129,9 +129,9 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
         while !cur.is_null() {
             unsafe {
                 if (*cur).key == key {
-                    bucket.ref_locked.lock();
+                    bucket.ref_locked.lock_exclusive();
                     ManuallyDrop::drop(&mut (*cur).value);
-                    bucket.ref_locked.unlock();
+                    bucket.ref_locked.unlock_exclusive();
                     (*cur).value = ManuallyDrop::new(value);
                     bucket.release();
                     self.inner().lock.unlock_group();
@@ -197,7 +197,7 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
         while !cur.is_null() {
             unsafe {
                 if (*cur).key.borrow() == key {
-                    bucket.ref_locked.lock();
+                    bucket.ref_locked.lock_exclusive();
                     let w_ref = WatchGuardMut::new(&mut *(*cur).value, bucket.ref_locked.clone());
 
                     bucket.release();
@@ -242,10 +242,10 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
 
                     bucket.release();
 
-                    bucket.ref_locked.lock();
+                    bucket.ref_locked.lock_exclusive();
                     let val = ManuallyDrop::into_inner(ptr::read(&(*cur).value));
                     drop(Box::from_raw(cur));
-                    bucket.ref_locked.unlock();
+                    bucket.ref_locked.unlock_exclusive();
                     self.inner().lock.unlock_group();
                     return Some(val);
                 }
@@ -280,7 +280,7 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
 impl<K, V> Clone for AtomicHashMap<K, V> {
     fn clone(&self) -> Self {
         let inner = unsafe { &*self.ptr };
-        inner.ref_count.fetch_add(1, Ordering::Acquire);
+        inner.ref_count.fetch_add(1, Ordering::Relaxed);
         Self { ptr: self.ptr }
     }
 }
@@ -289,7 +289,7 @@ impl<K, V> Drop for AtomicHashMap<K, V> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.ptr };
         if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            atomic::fence(Ordering::Release);
+            atomic::fence(Ordering::Acquire);
 
             for bucket in &inner.buckets {
                 let mut cur = bucket.head.load(Ordering::Acquire);
@@ -362,7 +362,7 @@ impl<'a, K: Eq + Hash, V> Iterator for Iter<'a, K, V> {
         let bucket = &self.map.inner().buckets[self.bucket_idx];
         let backoff = Backoff::new();
 
-        while bucket.ref_locked.is_locked() {
+        while bucket.ref_locked.is_locked_exclusive() {
             backoff.snooze();
         }
 
@@ -379,7 +379,7 @@ impl<'a, K: Eq + Hash, V> Iterator for Iter<'a, K, V> {
 
 impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
     pub fn iter(&self) -> Iter<'_, K, V> {
-        self.inner().lock.lock();
+        self.inner().lock.lock_exclusive();
         Iter::new(self)
     }
 }
@@ -387,7 +387,7 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
 impl<'a, K, V> Drop for Iter<'a, K, V> {
     fn drop(&mut self) {
         unsafe {
-            (&*self.map.ptr).lock.unlock();
+            (&*self.map.ptr).lock.unlock_exclusive();
         }
     }
 }

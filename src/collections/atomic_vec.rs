@@ -148,7 +148,7 @@ impl<T> AtomicVec<T> {
 
     #[inline]
     pub fn is_busy(&self) -> bool {
-        self.inner().state.load(Ordering::Relaxed) != AVAILABLE
+        self.inner().state.load(Ordering::Acquire) != AVAILABLE
     }
 
     #[inline]
@@ -196,7 +196,7 @@ impl<T> Item<T> {
 
 impl<T> Clone for AtomicVec<T> {
     fn clone(&self) -> Self {
-        self.inner().ref_count.fetch_add(1, Ordering::Acquire);
+        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
         Self { ptr: self.ptr }
     }
 }
@@ -204,7 +204,7 @@ impl<T> Clone for AtomicVec<T> {
 impl<T> Drop for AtomicVec<T> {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            atomic::fence(Ordering::Release);
+            atomic::fence(Ordering::Acquire);
 
             let ptr = self.ptr as *mut AtomicInner<T>;
 
@@ -230,7 +230,7 @@ impl<T> fmt::Debug for AtomicVec<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AtomicVec")
             .field("type", &std::any::type_name::<T>())
-            .field("len", &self.inner().len)
+            .field("len", &self.len())
             .finish()
     }
 }

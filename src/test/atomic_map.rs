@@ -1,4 +1,4 @@
-mod test_atomic_map {
+mod tests_atomic_map {
     use std::sync::Arc;
     use std::thread;
     use crate::collections::AtomicHashMap;

@@ -4,6 +4,7 @@ use crate::arw::Arw;
 use crate::utils::is_dangling;
 use std::alloc::{dealloc, Layout};
 use std::num::NonZeroUsize;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::process::abort;
 use std::ptr;
 use std::sync::atomic;
@@ -16,6 +17,9 @@ pub struct WeakArw<T: Sized> {
 
 unsafe impl<T: Sized + Sync + Send> Send for WeakArw<T> {}
 unsafe impl<T: Sized + Sync + Send> Sync for WeakArw<T> {}
+
+impl<T> UnwindSafe for WeakArw<T> {}
+impl<T> RefUnwindSafe for WeakArw<T> {}
 
 impl<T> WeakArw<T> {
     /// Constructs a new `WeakARW`, without allocating any memory.

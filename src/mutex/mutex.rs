@@ -1,14 +1,22 @@
 use crate::collections::AtomicVec;
 use crate::mutex::Backoff;
+use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::sync::atomic::{AtomicU8, AtomicUsize};
 use std::thread::Thread;
-use std::{fmt, thread};
+use std::{fmt, hint, thread};
 
 enum MutexType {
     Exclusive,
     Group,
 }
+
+/// Layout packing (AtomicUsize):
+/// lower 3 bit: state
+/// remaining bits: locked counter (shifted right by SHIFT_LOCKED)
+const SHIFT_LOCKED: usize = 3;
+const MASK_STATE: usize = (1 << SHIFT_LOCKED) - 1;
 
 /// A fast user space thread locker
 type State = u8;
@@ -28,6 +36,7 @@ struct InnerMutex {
     parking_e: AtomicVec<Thread>,
     parking_g: AtomicVec<Thread>,
     locked: AtomicUsize,
+    wake_deadlock: AtomicU8,
 }
 
 #[repr(transparent)]
@@ -38,6 +47,9 @@ pub struct Mutex {
 unsafe impl Send for Mutex {}
 unsafe impl Sync for Mutex {}
 
+impl UnwindSafe for Mutex {}
+impl RefUnwindSafe for Mutex {}
+
 impl Mutex {
     pub fn new() -> Self {
         let ptr = Box::into_raw(Box::new(InnerMutex {
@@ -46,6 +58,7 @@ impl Mutex {
             parking_e: AtomicVec::new(),
             parking_g: AtomicVec::new(),
             locked: AtomicUsize::new(0),
+            wake_deadlock: AtomicU8::new(UNLOCKED),
         }));
         if ptr.is_null() {
             panic!("Happened an invalid allocation for Mutex");
@@ -62,13 +75,13 @@ impl Mutex {
         unsafe { &*self.ptr }
     }
 
-    pub fn lock(&self) {
+    pub fn lock_exclusive(&self) {
         let backoff = Backoff::new();
         let inner = self.inner();
 
         loop {
             // Spin first to speed things up if the lock is released quickly.
-            match self.spin(20) {
+            match self.spin(10) {
                 DIRTY => {
                     // if the state is DIRTY and there are no other group waiting is safe to switch to LOCKED
                     if inner.locked.load(Acquire) == 0 {
@@ -101,19 +114,19 @@ impl Mutex {
     }
 
     pub fn lock_group(&self) {
+        let inner = self.inner();
         let backoff = Backoff::new();
 
         // we add it here so that as soon as the lock is available we can proceed to execute
         // all the multi lock group.
         // SAFETY: The unlock will fetch_sub only when the internal state is on LOCKED_GROUP state
-        self.inner().locked.fetch_add(1, Acquire);
+        inner.locked.fetch_add(1, Release);
 
         loop {
             // Spin first to speed things up if the lock is released quickly.
-            match self.spin(20) {
+            match self.spin(10) {
                 DIRTY => {
-                    if self
-                        .inner()
+                    if inner
                         .state
                         .compare_exchange(DIRTY, LOCKED_GROUP, Acquire, Relaxed)
                         .is_ok()
@@ -123,13 +136,15 @@ impl Mutex {
                     }
                 }
                 LOCKED_GROUP => {
-                    // if some thread are parked let's wake them up
-                    self.wake(MutexType::Group);
+                    // fix data race
+                    if inner.state.load(Acquire) == LOCKED_GROUP {
+                        // if some thread are parked let's wake them up
+                        self.wake(MutexType::Group);
+                    }
                     break;
                 }
                 _ => {
-                    if self
-                        .inner()
+                    if inner
                         .state
                         .compare_exchange(UNLOCKED, LOCKED_GROUP, Acquire, Relaxed)
                         .is_ok()
@@ -156,9 +171,14 @@ impl Mutex {
     }
 
     #[inline]
-    pub fn is_locked(&self) -> bool {
+    pub fn is_locked_exclusive(&self) -> bool {
         let state = self.inner().state.load(Acquire);
         !(state == UNLOCKED || (state == DIRTY && self.inner().locked.load(Acquire) == 0))
+    }
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.is_locked_group() || self.is_locked_exclusive()
     }
 
     #[inline]
@@ -169,11 +189,11 @@ impl Mutex {
             let state = self.inner().state.load(Relaxed);
 
             // We stop spinning when the mutex is UNLOCKED
-            if state == UNLOCKED || spin == 0 {
+            if state == UNLOCKED || state == DIRTY || spin == 0 {
                 return state;
             }
 
-            std::hint::spin_loop();
+            hint::spin_loop();
             spin -= 1;
         }
     }
@@ -184,12 +204,15 @@ impl Mutex {
     }
 
     pub fn unlock_group(&self) {
-        if self.inner().state.load(Acquire) != LOCKED_GROUP {
-            panic!("Trying to unlock a non Locked Group");
+        let inner = self.inner();
+        let state = inner.state.load(Acquire);
+
+        if state != LOCKED_GROUP && state != DIRTY {
+            panic!("Trying to unlock a non Locked Group {}", state);
         }
 
-        if self.inner().locked.fetch_sub(1, Release) == 1 {
-            self.inner().state.store(DIRTY, Release);
+        if inner.locked.fetch_sub(1, Release) == 1 {
+            inner.state.store(DIRTY, Release);
 
             // if there are some thread suspended now we must wake them up
             if !self.wake(MutexType::Exclusive) {
@@ -198,22 +221,7 @@ impl Mutex {
         }
     }
 
-    pub fn try_lock(&self) -> bool {
-        if self.inner().locked.load(Acquire) == 0 {
-            return self
-                .inner()
-                .state
-                .compare_exchange(DIRTY, LOCKED, Acquire, Relaxed)
-                .is_ok();
-        }
-
-        self.inner()
-            .state
-            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
-            .is_ok()
-    }
-
-    pub fn unlock(&self) {
+    pub fn unlock_exclusive(&self) {
         if self
             .inner()
             .state
@@ -229,38 +237,88 @@ impl Mutex {
         }
     }
 
+    pub fn try_lock_exclusive(&self) -> bool {
+        if self.inner().locked.load(Acquire) == 0 {
+            return self
+                .inner()
+                .state
+                .compare_exchange(DIRTY, LOCKED, Acquire, Relaxed)
+                .is_ok();
+        }
+
+        self.inner()
+            .state
+            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
+            .is_ok()
+    }
+
     #[inline]
     fn suspend(&self, t: MutexType) {
+        if self
+            .inner()
+            .wake_deadlock
+            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
+            .is_err()
+        {
+            return;
+        }
         let parking = match t {
             MutexType::Exclusive => &self.inner().parking_e,
             MutexType::Group => &self.inner().parking_g,
         };
         parking.push(thread::current());
-        thread::park()
+        self.inner().wake_deadlock.store(UNLOCKED, Release);
+        thread::park();
     }
 
     #[inline]
     fn wake_all(&self, t: MutexType) {
+        while self
+            .inner()
+            .wake_deadlock
+            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
+            .is_err()
+        {
+            hint::spin_loop();
+        }
         let parking = match t {
             MutexType::Exclusive => &self.inner().parking_e,
             MutexType::Group => &self.inner().parking_g,
         };
-        while let Some(thread) = parking.pop() {
+
+        if let Some(thread) = parking.pop() {
             thread.unpark();
+            // pre-release to improve performances
+            self.inner().wake_deadlock.store(UNLOCKED, Release);
+            while let Some(thread) = parking.pop() {
+                thread.unpark();
+            }
         }
+        self.inner().wake_deadlock.store(UNLOCKED, Release);
     }
 
     #[inline]
     fn wake(&self, t: MutexType) -> bool {
+        while self
+            .inner()
+            .wake_deadlock
+            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
+            .is_err()
+        {
+            hint::spin_loop();
+        }
         let parking = match t {
             MutexType::Exclusive => &self.inner().parking_e,
             MutexType::Group => &self.inner().parking_g,
         };
-        if let Some(thread) = parking.pop() {
+        let res = if let Some(thread) = parking.pop() {
             thread.unpark();
-            return true;
-        }
-        false
+            true
+        } else {
+            false
+        };
+        self.inner().wake_deadlock.store(UNLOCKED, Release);
+        res
     }
 }
 
@@ -273,7 +331,9 @@ impl Clone for Mutex {
 
 impl Drop for Mutex {
     fn drop(&mut self) {
-        if self.inner().ref_count.fetch_sub(1, Relaxed) == 1 {
+        if self.inner().ref_count.fetch_sub(1, Release) == 1 {
+            atomic::fence(Acquire);
+
             let ptr = self.ptr as *mut InnerMutex;
             unsafe { drop(Box::from_raw(ptr)) };
         }
