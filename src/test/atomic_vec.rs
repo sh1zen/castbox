@@ -2,11 +2,12 @@ mod tests_atomic_vec {
     use std::sync::{Arc, Barrier};
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
     use std::thread;
+    use std::time::Instant;
     use crate::collections::AtomicVec;
 
     #[test]
     fn stress_test() {
-        use std::thread;
+        let started = Instant::now();
         let vec = AtomicVec::new();
         let vec_c = vec.clone();
 
@@ -40,6 +41,7 @@ mod tests_atomic_vec {
         }
 
         assert!(vec.pop().is_none());
+        println!("{:?}", started.elapsed());
     }
 
     #[test]
@@ -87,7 +89,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn multithreaded_push() {
-        let v = Arc::new(AtomicVec::new());
+        let v = AtomicVec::new();
         const N: usize = 8;
         const PER_THREAD: usize = 100;
 
@@ -111,7 +113,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn multithreaded_pop() {
-        let v = Arc::new(AtomicVec::new());
+        let v = AtomicVec::new();
         const N: usize = 4;
         const PER_THREAD: usize = 50;
 
@@ -150,7 +152,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn stress_push_pop_mixed() {
-        let v = Arc::new(AtomicVec::new());
+        let v = AtomicVec::new();
         const THREADS: usize = 6;
         const OPS: usize = 200;
 

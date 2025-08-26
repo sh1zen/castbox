@@ -1,7 +1,6 @@
 use crate::mutex::Mutex;
 use std::any::Any;
 use std::cell::UnsafeCell;
-use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 
 /// Max number of reference that an any_ref could have
@@ -34,13 +33,14 @@ impl<T> ArwInner<T> {
         self.val.get()
     }
 
+    #[inline]
     pub(crate) fn get_ref(&self) -> &T {
         unsafe { &*self.internal_get() }
     }
 
+    #[inline]
     pub(crate) fn get_mut_ref(&self) -> &mut T {
-        let mut value = unsafe { NonNull::new_unchecked(self.internal_get()) };
-        unsafe { &mut *value.as_mut() }
+        unsafe { &mut *self.internal_get() }
     }
 }
 

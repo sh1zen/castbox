@@ -1,5 +1,5 @@
 
-# 📦 A Runtime-Typed Reference-Counted Smart Pointer and concurrent programming tools.
+# 📦 Rust Concurrent Primitives: Runtime-Typed Smart Pointers & Lock-Free Data Structures.
 
 
 ---
@@ -198,12 +198,12 @@ drop(mutex);
 
 ## 📦 Installation
 
-Install AnyRef from crates.io
+Install castbox from crates.io
 Open your Cargo.toml and add:
 
 ```toml
 [dependencies]
-castbox = "0.0.9" # or the latest version available 
+castbox = "0.0.10" # or the latest version available 
 ```
 ---
 

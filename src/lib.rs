@@ -11,19 +11,18 @@
     rust_2024_compatibility,
     rust_2018_idioms,
     rustdoc::broken_intra_doc_links,
-    unreachable_pub,
+    unreachable_pub
 )]
 
 mod any_ref;
+mod arw;
+pub mod channels;
+pub mod collections;
 pub mod mutex;
 pub mod utils;
-
-pub mod collections;
-
-#[cfg(test)]
-mod test;
-mod arw;
 
 pub use any_ref::{AnyRef, WeakAnyRef};
 pub use arw::{Arw, WeakArw};
 
+#[cfg(test)]
+mod test;

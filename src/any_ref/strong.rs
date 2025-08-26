@@ -75,6 +75,7 @@ impl AnyRef {
         Ok(elem)
     }
 
+    #[inline]
     pub(crate) fn inner(&self) -> &AnyRefInner {
         // This unsafety is ok because while this AnyRef is alive we're guaranteed
         // that the inner pointer is valid.
@@ -82,6 +83,7 @@ impl AnyRef {
         unsafe { &*ptr }
     }
 
+    #[inline]
     fn inner_mut(&mut self) -> &mut AnyRefInner {
         let ptr: *mut AnyRefInner = self.get_mut_inner_ptr();
         unsafe { &mut *ptr }
@@ -282,9 +284,8 @@ impl AnyRef {
         if self.inner().type_id == TypeId::of::<U>() {
             let lock = self.inner().lock.clone();
             lock.lock_group();
-
-            let data = self.inner().get_ref();
-            let data = data.downcast_ref::<U>();
+            
+            let data = self.inner().get_ref().downcast_ref::<U>();
 
             match data {
                 Some(t) => Some(WatchGuardRef::new(t, lock)),
@@ -304,6 +305,7 @@ impl AnyRef {
             lock.lock_exclusive();
 
             let data = self.inner().get_mut_ref().downcast_mut::<U>();
+            
             match data {
                 Some(t) => Some(WatchGuardMut::new(t, lock)),
                 None => {

@@ -1,7 +1,6 @@
 use crate::mutex::Mutex;
 use std::any::{Any, TypeId};
 use std::cell::UnsafeCell;
-use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 
 /// Max number of reference that an any_ref could have
@@ -9,12 +8,12 @@ pub(super) const MAX_REFCOUNT: usize = isize::MAX as usize;
 
 /// Actually the main worker of AnyRef
 pub(crate) struct AnyRefInner {
-    pub(crate) data: UnsafeCell<Box<dyn Any>>,
-    pub(crate) type_id: TypeId,
-    pub(crate) type_name: &'static str,
-    pub(crate) lock: Mutex,
     pub(crate) strong: AtomicUsize,
     pub(crate) weak: AtomicUsize,
+    pub(crate) type_id: TypeId,
+    pub(crate) data: UnsafeCell<Box<dyn Any>>,
+    pub(crate) type_name: &'static str,
+    pub(crate) lock: Mutex,
 }
 
 impl AnyRefInner {
@@ -53,8 +52,7 @@ impl AnyRefInner {
     }
 
     pub(crate) fn get_mut_ref(&self) -> &mut dyn Any {
-        let mut value = unsafe { NonNull::new_unchecked(self.internal_get()) };
-        unsafe { &mut *value.as_mut() }
+        unsafe { &mut *self.internal_get() }
     }
 }
 

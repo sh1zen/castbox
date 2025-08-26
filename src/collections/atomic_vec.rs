@@ -1,4 +1,5 @@
 use crate::mutex::Backoff;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::null_mut;
@@ -23,11 +24,11 @@ struct AtomicInner<T> {
     /// numbers of items in the vec
     len: AtomicUsize,
 
-    /// vec state
-    state: AtomicBool,
-
     /// cloned ref
     ref_count: AtomicUsize,
+
+    /// vec state
+    state: AtomicBool,
 }
 
 #[repr(transparent)]
@@ -48,12 +49,14 @@ impl<T> AtomicVec<T> {
             tail: AtomicPtr::new(null_mut()),
             t_tail: AtomicPtr::new(null_mut()),
             len: AtomicUsize::new(0),
-            state: AtomicBool::new(AVAILABLE),
             ref_count: AtomicUsize::new(1),
+            state: AtomicBool::new(AVAILABLE),
         }));
+
         if ptr.is_null() {
             panic!("Happened an invalid allocation for AtomicVec");
         }
+
         Self { ptr }
     }
 
@@ -152,7 +155,7 @@ impl<T> AtomicVec<T> {
     }
 
     #[inline]
-    fn lock(&self) {
+    pub fn lock(&self) {
         let backoff = Backoff::new();
         while self
             .inner()
@@ -165,7 +168,7 @@ impl<T> AtomicVec<T> {
     }
 
     #[inline]
-    fn release(&self) {
+    pub fn release(&self) {
         let item = self.inner().t_tail.swap(null_mut(), Ordering::Acquire);
 
         if !item.is_null() {
@@ -173,6 +176,21 @@ impl<T> AtomicVec<T> {
         }
 
         self.inner().state.store(AVAILABLE, Ordering::Release);
+    }
+}
+
+impl<T> AtomicVec<T> {
+    pub fn to_vec(&self) -> Vec<T> {
+        self.lock();
+
+        let mut vec = Vec::with_capacity(self.len());
+
+        while let Some(e) = self.pop() {
+            vec.push(e);
+        }
+        self.release();
+
+        vec
     }
 }
 
@@ -191,6 +209,26 @@ impl<T> Item<T> {
             value: ManuallyDrop::new(val),
             next: AtomicPtr::new(null_mut()),
         }))
+    }
+}
+
+impl<T> From<Vec<T>> for AtomicVec<T> {
+    fn from(vec: Vec<T>) -> Self {
+        let atomic_vec = Self::new();
+        for v in vec {
+            atomic_vec.push(v);
+        }
+        atomic_vec
+    }
+}
+
+impl<T: Clone> From<&[T]> for AtomicVec<T> {
+    fn from(slice: &[T]) -> Self {
+        let atomic_vec = Self::new();
+        for v in slice {
+            atomic_vec.push(v.clone());
+        }
+        atomic_vec
     }
 }
 
@@ -222,6 +260,87 @@ impl<T> Drop for AtomicVec<T> {
             }
 
             unsafe { drop(Box::from_raw(ptr)) };
+        }
+    }
+}
+
+pub struct IntoIter<T> {
+    current: *mut Item<T>,
+}
+
+impl<T> IntoIterator for AtomicVec<T> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let head = self.inner().head.load(Ordering::Acquire);
+        std::mem::forget(self);
+        IntoIter { current: head }
+    }
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current.is_null() {
+            return None;
+        }
+
+        unsafe {
+            let node = self.current;
+            let next = (*node).next.load(Ordering::Acquire);
+            self.current = next;
+
+            let val = ManuallyDrop::into_inner(ptr::read(&(*node).value));
+            drop(Box::from_raw(node));
+
+            Some(val)
+        }
+    }
+}
+
+impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        unsafe {
+            while !self.current.is_null() {
+                let node = self.current;
+                let next = (*node).next.load(Ordering::Acquire);
+                ManuallyDrop::drop(&mut (*node).value);
+                drop(Box::from_raw(node));
+                self.current = next;
+            }
+        }
+    }
+}
+
+pub struct Iter<'a, T> {
+    current: *mut Item<T>,
+    marker: PhantomData<&'a T>,
+}
+
+impl<T> AtomicVec<T> {
+    pub fn iter(&self) -> Iter<'_, T> {
+        let head = self.inner().head.load(Ordering::Acquire);
+        Iter {
+            current: head,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current.is_null() {
+            return None;
+        }
+
+        unsafe {
+            let node = &*self.current;
+            self.current = node.next.load(Ordering::Acquire);
+            Some(&*node.value)
         }
     }
 }

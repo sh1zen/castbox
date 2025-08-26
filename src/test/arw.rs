@@ -1,14 +1,14 @@
 mod tests_arw {
     use crate::mutex::WatchGuardRef;
     use crate::{Arw, WeakArw};
+    use std::sync::Barrier;
     use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    use std::sync::Barrier;
-    use std::time::Instant;
     use std::{hint, thread};
+    use std::time::Instant;
 
     #[test]
-    fn stress_test() {
+    fn stress_test_arw() {
         let started = Instant::now();
         let a = Arw::new("hello".to_string());
 

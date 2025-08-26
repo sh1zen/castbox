@@ -1,9 +1,9 @@
 [package]
 name = "castbox"
-version = "0.0.9"
+version = "0.0.10"
 authors = ["sh1zen dev.sh1zen@outlook.it"]
 edition = "2024"
-description = "A Runtime-Typed Reference-Counted Smart Pointer and concurrent programming tools."
+description = "A Runtime-Typed Reference-Counted Smart Pointer and Concurrent Programming tools."
 license = "Apache-2.0"
 repository = "https://github.com/sh1zen/castbox"
 documentation = "https://docs.rs/castbox"

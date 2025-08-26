@@ -22,6 +22,8 @@ unsafe impl<T: Sized + Sync + Send> Sync for Arw<T> {}
 
 impl<T: Sized> UnwindSafe for Arw<T> {}
 impl<T: Sized> RefUnwindSafe for Arw<T> {}
+
+
 impl<T> Arw<T> {
     /// Creates a new `Arw` containing the given value.
     ///
@@ -73,6 +75,7 @@ impl<T> Arw<T> {
         Ok(elem)
     }
 
+    #[inline]
     fn inner(&self) -> &ArwInner<T> {
         // This unsafety is ok because while this Arw is alive we're guaranteed
         // that the inner pointer is valid.
@@ -80,6 +83,7 @@ impl<T> Arw<T> {
         unsafe { &*ptr }
     }
 
+    #[inline]
     fn inner_mut(&self) -> &mut ArwInner<T> {
         let ptr: *mut ArwInner<T> = self.get_mut_inner_ptr();
         unsafe { &mut *ptr }
@@ -89,7 +93,6 @@ impl<T> Arw<T> {
         self.inner().lock.is_locked_exclusive()
     }
 
-    #[inline]
     pub fn map<U: 'static, F>(self, func: F) -> Arw<U>
     where
         T: Any,

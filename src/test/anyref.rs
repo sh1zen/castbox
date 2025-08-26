@@ -8,7 +8,7 @@ mod tests_any_ref {
     use std::thread;
 
     #[test]
-    fn stress_test() {
+    fn stress_test_any_ref() {
         let a = AnyRef::new("hello".to_string());
 
         if let Some(s) = a.try_downcast_ref::<String>() {
