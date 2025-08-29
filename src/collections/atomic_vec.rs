@@ -1,10 +1,10 @@
-use crate::mutex::Backoff;
+use crate::core::smutex::SMutex;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::null_mut;
 use std::sync::atomic;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::{fmt, ptr};
 
 const AVAILABLE: bool = true;
@@ -28,7 +28,7 @@ struct AtomicInner<T> {
     ref_count: AtomicUsize,
 
     /// vec state
-    state: AtomicBool,
+    state: SMutex,
 }
 
 #[repr(transparent)]
@@ -50,7 +50,7 @@ impl<T> AtomicVec<T> {
             t_tail: AtomicPtr::new(null_mut()),
             len: AtomicUsize::new(0),
             ref_count: AtomicUsize::new(1),
-            state: AtomicBool::new(AVAILABLE),
+            state: SMutex::new(),
         }));
 
         if ptr.is_null() {
@@ -151,20 +151,12 @@ impl<T> AtomicVec<T> {
 
     #[inline]
     pub fn is_busy(&self) -> bool {
-        self.inner().state.load(Ordering::Acquire) != AVAILABLE
+        self.inner().state.is_locked()
     }
 
     #[inline]
     pub fn lock(&self) {
-        let backoff = Backoff::new();
-        while self
-            .inner()
-            .state
-            .compare_exchange(AVAILABLE, UPDATING, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            backoff.snooze();
-        }
+        self.inner().state.raw_lock();
     }
 
     #[inline]
@@ -175,7 +167,7 @@ impl<T> AtomicVec<T> {
             self.update_tail(item);
         }
 
-        self.inner().state.store(AVAILABLE, Ordering::Release);
+        self.inner().state.raw_unlock();
     }
 }
 

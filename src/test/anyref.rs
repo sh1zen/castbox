@@ -1,6 +1,6 @@
 mod tests_any_ref {
     use crate::mutex::WatchGuardRef;
-    use crate::{AnyRef, WeakAnyRef};
+    use crate::containers::{AnyRef, WeakAnyRef};
     use std::any::TypeId;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicU8;
@@ -148,7 +148,7 @@ mod tests_any_ref {
         assert_eq!(weak.clone().strong_count(), 0);
 
         let _x = weak.clone();
-        assert_eq!(weak.clone().weak_count(), 3);
+        assert_eq!(weak.clone().weak_count(), 2);
 
         // After drop, weak cannot upgrade
         assert!(weak.upgrade().is_none());

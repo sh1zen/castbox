@@ -1,11 +1,11 @@
 mod tests_arw {
     use crate::mutex::WatchGuardRef;
-    use crate::{Arw, WeakArw};
-    use std::sync::Barrier;
+    use crate::containers::{Arw, WeakArw};
     use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
-    use std::{hint, thread};
+    use std::sync::Barrier;
     use std::time::Instant;
+    use std::{hint, thread};
 
     #[test]
     fn stress_test_arw() {
@@ -27,6 +27,7 @@ mod tests_arw {
                 for _ in 0..100 {
                     rc.push_str(":1")
                 }
+                assert!(rc.is_locked())
             }));
         }
 
@@ -34,8 +35,9 @@ mod tests_arw {
             let val_clone = val.clone();
             handles.push(thread::spawn(move || {
                 for _ in 0..100 {
-                    let _clone = val_clone.as_ref();
-                    let _u = hint::black_box(_clone);
+                    let clone = val_clone.as_ref();
+                    let u = hint::black_box(clone);
+                    assert!(u.is_locked())
                 }
             }));
         }

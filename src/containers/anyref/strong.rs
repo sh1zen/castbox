@@ -1,9 +1,9 @@
-use crate::arw::inner::{ArwInner, MAX_REFCOUNT};
-use crate::arw::ptr_interface::PtrInterface;
-use crate::arw::WeakArw;
+use crate::containers::anyref::inner::{AnyRefInner, MAX_REFCOUNT};
+use crate::containers::anyref::ptr_interface::PtrInterface;
+use crate::containers::anyref::weak::WeakAnyRef;
 use crate::mutex::{WatchGuardMut, WatchGuardRef};
 use crate::utils::is_dangling;
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
 use std::panic::{RefUnwindSafe, UnwindSafe};
@@ -13,43 +13,42 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::{fmt, hint, ptr};
 
 #[repr(transparent)]
-pub struct Arw<T: Sized> {
-    ptr: *const ArwInner<T>,
+pub struct AnyRef {
+    ptr: *const AnyRefInner,
 }
 
-unsafe impl<T: Sized + Sync + Send> Send for Arw<T> {}
-unsafe impl<T: Sized + Sync + Send> Sync for Arw<T> {}
+unsafe impl Send for AnyRef {}
+unsafe impl Sync for AnyRef {}
 
-impl<T: Sized> UnwindSafe for Arw<T> {}
-impl<T: Sized> RefUnwindSafe for Arw<T> {}
+impl UnwindSafe for AnyRef {}
+impl RefUnwindSafe for AnyRef {}
 
-
-impl<T> Arw<T> {
-    /// Creates a new `Arw` containing the given value.
+impl AnyRef {
+    /// Creates a new `AnyRef` containing the given value.
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new(42);
-    /// assert_eq!(a.as_ref(), 42);
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::new(42);
+    /// assert_eq!(a.as_ref::<i32>(), 42);
     /// ```
-    pub fn new(value: T) -> Self
+    pub fn new<T>(value: T) -> Self
     where
-        T: Any,
+        T: Any + Sized,
     {
-        unsafe { Self::from_inner(Box::leak(Box::new(ArwInner::new(value)))) }
+        unsafe { Self::from_inner(Box::leak(Box::new(AnyRefInner::new(value)))) }
     }
 
     /// Attempts to extract the inner value if there is exactly one strong reference.
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new(123i32);
-    /// let value = Arw::try_unwrap(a).unwrap();
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::new(123i32);
+    /// let value = AnyRef::try_unwrap::<i32>(a).unwrap();
     /// assert_eq!(value, 123i32);
     /// ```
-    pub fn try_unwrap(this: Self) -> Result<T, Self> {
+    pub fn try_unwrap<T>(this: Self) -> Result<T, Self> {
         this.inner().lock.lock_exclusive();
         if this
             .inner()
@@ -64,28 +63,29 @@ impl<T> Arw<T> {
         atomic::fence(Acquire);
 
         let this = ManuallyDrop::new(this);
-        let elem: T = unsafe { this.read_data() };
+        let this_data = unsafe { &**(*this.ptr).data.get() as *const _ };
+        let elem: T = unsafe { ptr::read(this_data as *const T) };
 
         // Make a weak pointer to clean up the implicit strong-weak reference
-        let _weak = WeakArw { ptr: this.ptr };
+        let _weak = WeakAnyRef { ptr: this.ptr };
 
-        unsafe { ptr::drop_in_place(&mut (*this.get_mut_inner_ptr()).val) }
+        unsafe { ptr::drop_in_place(&mut (*this.get_mut_inner_ptr()).data) }
         unsafe { ptr::drop_in_place(&mut (*this.get_mut_inner_ptr()).lock) }
 
         Ok(elem)
     }
 
     #[inline]
-    fn inner(&self) -> &ArwInner<T> {
-        // This unsafety is ok because while this Arw is alive we're guaranteed
+    pub(crate) fn inner(&self) -> &AnyRefInner {
+        // This unsafety is ok because while this AnyRef is alive we're guaranteed
         // that the inner pointer is valid.
-        let ptr: *const ArwInner<T> = self.ptr;
+        let ptr: *const AnyRefInner = self.ptr;
         unsafe { &*ptr }
     }
 
     #[inline]
-    fn inner_mut(&self) -> &mut ArwInner<T> {
-        let ptr: *mut ArwInner<T> = self.get_mut_inner_ptr();
+    fn inner_mut(&mut self) -> &mut AnyRefInner {
+        let ptr: *mut AnyRefInner = self.get_mut_inner_ptr();
         unsafe { &mut *ptr }
     }
 
@@ -93,60 +93,45 @@ impl<T> Arw<T> {
         self.inner().lock.is_locked_exclusive()
     }
 
-    pub fn map<U: 'static, F>(self, func: F) -> Arw<U>
+    #[inline]
+    pub fn map<T, U: 'static, F>(self, func: F) -> AnyRef
     where
         T: Any,
         F: FnOnce(WatchGuardRef<'_, T>) -> U,
     {
-        Arw::new(func(self.as_ref()))
+        let ptr = self.as_ref::<T>();
+        AnyRef::new(func(ptr))
     }
 
-    /// Returns a reference to the inner value of type `T`.
-    /// Panics if the type does not match `T`.
+    /// Returns a raw pointer to the contained type, if possible.
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new(3.14f32);
-    /// let f = a.as_ref();
-    /// assert_eq!(*f, 3.14f32);
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::new(50);
+    /// let ptr = unsafe { a.as_cast_ptr::<i32>() };
+    /// unsafe { assert_eq!(*ptr, 50); }
     /// ```
-    pub fn as_ref(&self) -> WatchGuardRef<'_, T> {
-        let lock = self.inner().lock.clone();
-        lock.lock_group();
-
-        WatchGuardRef::new(self.inner().get_ref(), lock)
+    pub unsafe fn as_cast_ptr<T: Any>(&self) -> *const T {
+        if self.inner().type_id != TypeId::of::<T>() {
+            panic!(
+                "AnyRef: wrong cast in as_ref::<{}>()",
+                std::any::type_name::<T>()
+            );
+        }
+        let ptr = self.as_ptr();
+        ptr as *const T
     }
 
-    /// Returns a mutable reference to the inner value of type `T`.
-    /// Panics if the type does not match `T`.
+    /// Returns `true` if the `AnyRef` is the only strong reference to the value.
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new(3i32);
-    /// {
-    ///     let mut f = a.as_mut();
-    ///     *f += 3i32;
-    /// }
-    /// assert_eq!(*a.as_ref(), 6i32);
-    /// ```
-    pub fn as_mut(&self) -> WatchGuardMut<'_, T> {
-        let lock = self.inner().lock.clone();
-        lock.lock_exclusive();
-
-        WatchGuardMut::new(self.inner().get_mut_ref(), lock)
-    }
-
-    /// Returns `true` if the `Arw` is the only strong reference to the value.
-    ///
-    /// # Example
-    /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new("unique");
-    /// assert!(Arw::is_unique(&a));
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::new("unique");
+    /// assert!(AnyRef::is_unique(&a));
     /// let b = a.clone();
-    /// assert!(!Arw::is_unique(&a));
+    /// assert!(!AnyRef::is_unique(&a));
     /// ```
     pub fn is_unique(this: &Self) -> bool {
         // lock the weak pointer count if we appear to be the sole weak pointer
@@ -181,11 +166,11 @@ impl<T> Arw<T> {
     /// # Example
     ///
     /// ```
-    /// use castbox::Arw;
-    /// let five = Arw::new(5);
-    /// let weak_five = Arw::downgrade(&five);
+    /// use castbox::containers::AnyRef;
+    /// let five = AnyRef::new(5);
+    /// let weak_five = AnyRef::downgrade(&five);
     /// ```
-    pub fn downgrade(&self) -> WeakArw<T> {
+    pub fn downgrade(&self) -> WeakAnyRef {
         // This Relaxed is OK because we're checking the value in the CAS
         // below.
         let mut cur = self.inner().weak.load(Relaxed);
@@ -202,7 +187,7 @@ impl<T> Arw<T> {
             assert!(cur <= MAX_REFCOUNT, "INTERNAL OVERFLOW ERROR");
 
             // NOTE: this code currently ignores the possibility of overflow
-            // into usize::MAX; in general both Rc and Arw need to be adjusted
+            // into usize::MAX; in general both Rc and AnyRef need to be adjusted
             // to deal with overflow.
 
             // Unlike with Clone(), we need this to be an Acquire read to
@@ -216,7 +201,7 @@ impl<T> Arw<T> {
                 Ok(_) => {
                     // Make sure we do not create a dangling Weak
                     debug_assert!(!is_dangling(self.inner()));
-                    return WeakArw { ptr: self.ptr };
+                    return WeakAnyRef { ptr: self.ptr };
                 }
                 Err(old) => cur = old,
             }
@@ -227,10 +212,10 @@ impl<T> Arw<T> {
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new(10);
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::new(10);
     /// let w = a.downgrade();
-    /// assert_eq!(Arw::weak_count(&a), 1);
+    /// assert_eq!(AnyRef::weak_count(&a), 1);
     /// ```
     #[inline]
     pub fn weak_count(this: &Self) -> usize {
@@ -244,10 +229,10 @@ impl<T> Arw<T> {
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new("count");
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::new("count");
     /// let b = a.clone();
-    /// assert_eq!(Arw::strong_count(&a), 2);
+    /// assert_eq!(AnyRef::strong_count(&a), 2);
     /// ```
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
@@ -259,48 +244,106 @@ impl<T> Arw<T> {
         ptr::addr_eq(this.get_mut_inner_ptr(), other.get_mut_inner_ptr())
     }
 
-    pub fn into_raw(self) -> *const T {
+    pub fn into_raw(self) -> *const Box<dyn Any> {
         // prevent auto drop
         let this = ManuallyDrop::new(self);
 
-        let inner: *mut ArwInner<T> = this.get_mut_inner_ptr();
+        let inner: *mut AnyRefInner = this.get_mut_inner_ptr();
 
         // Make sure Miri realizes that we transition from a noalias pointer to a raw pointer here.
-        let cell_ptr: *const UnsafeCell<T> = unsafe { ptr::addr_of!((*inner).val) };
-        let data_ptr: *const T = cell_ptr.cast::<T>();
+        let cell_ptr: *const UnsafeCell<Box<dyn Any>> = unsafe { ptr::addr_of!((*inner).data) };
+        let data_ptr: *const Box<dyn Any> = cell_ptr.cast::<Box<dyn Any>>();
 
         data_ptr
     }
 
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
+    pub unsafe fn from_raw<T: ?Sized>(ptr: *const T) -> Self {
         unsafe { Self::from_raw_in(ptr) }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        self.inner().type_name
     }
 }
 
-impl<T> PtrInterface<T> for Arw<T> {
+impl PtrInterface for AnyRef {
     #[inline]
-    fn get_mut_inner_ptr(&self) -> *mut ArwInner<T> {
-        self.ptr as *mut ArwInner<T>
+    fn get_mut_inner_ptr(&self) -> *mut AnyRefInner {
+        self.ptr as *mut AnyRefInner
     }
 
     #[inline]
-    unsafe fn from_inner_in(ptr: *mut ArwInner<T>) -> Self {
+    unsafe fn from_inner_in(ptr: *mut AnyRefInner) -> Self {
         debug_assert!(!ptr.is_null());
         Self { ptr }
     }
 }
 
-impl<T> Clone for Arw<T> {
-    /// Makes a clone of the `Arw` pointer.
+impl AnyRef {
+    pub fn try_downcast_ref<U: Any>(&self) -> Option<WatchGuardRef<'_, U>> {
+        if self.inner().type_id == TypeId::of::<U>() {
+            let lock = self.inner().lock.clone();
+            lock.lock_group();
+            
+            let data = self.inner().get_ref().downcast_ref::<U>();
+
+            match data {
+                Some(t) => Some(WatchGuardRef::new(t, lock)),
+                None => {
+                    lock.unlock_group();
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn try_downcast_mut<U: Any>(&self) -> Option<WatchGuardMut<'_, U>> {
+        if self.inner().type_id == TypeId::of::<U>() {
+            let lock = self.inner().lock.clone();
+            lock.lock_exclusive();
+
+            let data = self.inner().get_mut_ref().downcast_mut::<U>();
+            
+            match data {
+                Some(t) => Some(WatchGuardMut::new(t, lock)),
+                None => {
+                    lock.unlock_exclusive();
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn as_ref<U: Any>(&self) -> WatchGuardRef<'_, U> {
+        match self.try_downcast_ref::<U>() {
+            Some(data) => data,
+            None => panic!("Downcast failed"),
+        }
+    }
+
+    pub fn as_mut<U: Any>(&self) -> WatchGuardMut<'_, U> {
+        match self.try_downcast_mut::<U>() {
+            Some(data) => data,
+            None => panic!("Downcast mut failed"),
+        }
+    }
+}
+
+impl Clone for AnyRef {
+    /// Makes a clone of the `AnyRef` pointer.
     ///
     /// This creates another pointer to the same allocation, increasing the
     /// strong reference count.
     #[inline]
-    fn clone(&self) -> Arw<T> {
+    fn clone(&self) -> AnyRef {
         // Using a relaxed ordering is alright here, as knowledge of the
         // original reference prevents other threads from erroneously deleting
         // the object.
-        if self.inner().strong.fetch_add(1, Relaxed) >= MAX_REFCOUNT {
+        if self.inner().strong.fetch_add(1, Relaxed) > MAX_REFCOUNT {
             abort();
         }
 
@@ -308,40 +351,50 @@ impl<T> Clone for Arw<T> {
     }
 }
 
-impl<T: Default> Default for Arw<T> {
-    fn default() -> Arw<T> {
+impl Default for AnyRef {
+    fn default() -> AnyRef {
         unsafe {
             Self::from_inner(Box::leak(Box::write(
                 Box::new_uninit(),
-                ArwInner::default(),
+                AnyRefInner::default(),
             )))
         }
     }
 }
 
-impl<T: Sized> Arw<T> {
+impl AnyRef {
+    /// Creates a new `AnyRef` using the default value of `T`.
+    ///
+    /// # Example
+    /// ```
+    /// use castbox::containers::AnyRef;
+    /// let a: AnyRef = AnyRef::default_with::<String>();
+    /// assert_eq!(a.as_ref::<String>(), "");
+    /// ```
+    pub fn default_with<T: 'static + Default>() -> Self {
+        Self::from(Box::new(T::default()))
+    }
+
     /// Replaces the inner value with a new value of type `T`.
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::new(0);
-    /// let a = Arw::fill(a, 123);
-    /// assert_eq!(a.as_ref(), 123);
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::new(0);
+    /// let a = AnyRef::fill(a, 123);
+    /// assert_eq!(a.as_ref::<i32>(), 123);
     /// ```
-    pub fn fill(this: Self, value: T) -> Self {
+    pub fn fill<T: 'static>(mut this: Self, value: T) -> Self {
         let ref_inner = &mut *this.inner_mut();
         ref_inner.lock.lock_exclusive();
-        ref_inner.val = UnsafeCell::new(value);
+        ref_inner.data = UnsafeCell::new(Box::new(value));
+        ref_inner.type_id = TypeId::of::<T>();
         ref_inner.lock.unlock_exclusive();
         this
     }
 }
 
-impl<T> Drop for Arw<T>
-where
-    T: Sized,
-{
+impl Drop for AnyRef {
     fn drop(&mut self) {
         // Because `fetch_sub` is already atomic, we do not need to synchronize
         // with other threads unless we are going to delete the object. This
@@ -352,87 +405,87 @@ where
 
         atomic::fence(Acquire);
 
-        let _weak = WeakArw { ptr: self.ptr };
+        let _weak = WeakAnyRef { ptr: self.ptr };
 
         unsafe { ptr::drop_in_place(&mut (*self.get_mut_inner_ptr()).lock) }
 
-        unsafe { ptr::drop_in_place(&mut (*self.get_mut_inner_ptr()).val) }
+        unsafe { ptr::drop_in_place(&mut (*self.get_mut_inner_ptr()).data) }
     }
 }
 
-impl<T: Sized + 'static> From<*mut T> for Arw<T> {
-    /// Creates a new `Arw` taking posses over the pointed value `*mut T`.
+impl<T: 'static> From<*mut T> for AnyRef {
+    /// Creates a new `AnyRef` taking posses over the pointed value `*mut T`.
     ///
     /// # Safety
     /// - `ptr` must be valid and pointing to a dynamically allocated instance of T
     ///   (ex. `Box::into_raw`).
-    /// - After Arw will own `ptr` and no other reference to ptr should be used.
+    /// - After AnyRef will own `ptr` and no other reference to ptr should be used.
     ///
     /// # Example
     /// ```
     /// use castbox::utils::{create_raw_pointer, dealloc_layout};
-    /// use castbox::Arw;
+    /// use castbox::containers::AnyRef;
     /// let raw = create_raw_pointer(String::from("hello"));
-    /// let a = Arw::from(raw);
-    /// a.as_mut().push_str(":1");
+    /// let a = AnyRef::from(raw);
+    /// a.as_mut::<String>().push_str(":1");
     /// dealloc_layout(raw);
-    /// assert_eq!(a.as_ref(), "hello:1");
+    /// assert_eq!(a.as_ref::<String>(), String::from("hello:1"));
     /// ```
     #[inline]
     fn from(ptr: *mut T) -> Self {
         let value = unsafe { ptr::read(ptr) };
-        Arw::new(value)
+        AnyRef::new(value)
     }
 }
 
-impl From<&str> for Arw<String> {
-    /// Creates a new `Arw` from a `*const T`.
+impl From<&str> for AnyRef {
+    /// Creates a new `AnyRef` from a `*const T`.
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
-    /// let a = Arw::from("hello");
-    /// assert_eq!(*a.as_ref(), "hello");
+    /// use castbox::containers::AnyRef;
+    /// let a = AnyRef::from("hello");
+    /// assert_eq!(*a.as_ref::<String>(), "hello");
     /// ```
     #[inline]
     fn from(s: &str) -> Self {
         // copy data to own them
-        Arw::new(s.to_string())
+        AnyRef::new(s.to_string())
     }
 }
 
-impl<T: 'static> From<Box<T>> for Arw<Box<T>> {
-    /// Creates a new `Arw` from a `Box<T>`.
+impl<T: 'static> From<Box<T>> for AnyRef {
+    /// Creates a new `AnyRef` from a `Box<T>`.
     ///
     /// # Example
     /// ```
-    /// use castbox::Arw;
+    /// use castbox::containers::AnyRef;
     /// let boxed = Box::new("hello");
-    /// let a = Arw::from(boxed);
-    /// assert_eq!(**a.as_ref(), "hello");
+    /// let a = AnyRef::from(boxed);
+    ///  assert_eq!(a.as_ref::<&str>(), "hello");
     /// ```
     #[inline]
     fn from(b: Box<T>) -> Self
     where
         T: Sized,
     {
-        Arw::new(b)
+        unsafe { Self::from_inner(Box::leak(Box::new(AnyRefInner::from_box(b)))) }
     }
 }
 
-impl<T> fmt::Debug for Arw<T> {
+impl fmt::Debug for AnyRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.inner();
-        f.debug_struct("Arw")
+        f.debug_struct("AnyRef")
+            .field("type", &inner.type_name)
             .field("S", &inner.strong)
             .field("W", &inner.weak)
-            .field("locked", &inner.lock.is_locked_exclusive())
             .finish()
     }
 }
 
-impl<T> fmt::Pointer for Arw<T> {
+impl fmt::Pointer for AnyRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&self.inner().val.get(), f)
+        fmt::Pointer::fmt(&self.inner().data.get(), f)
     }
 }

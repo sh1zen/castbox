@@ -1,5 +1,7 @@
-mod atomic_vec;
+mod atomic_chain;
 mod atomic_hashmap;
+mod atomic_vec;
 
-pub use atomic_vec::AtomicVec;
+pub use atomic_chain::AtomicChain;
 pub use atomic_hashmap::AtomicHashMap;
+pub use atomic_vec::AtomicVec;

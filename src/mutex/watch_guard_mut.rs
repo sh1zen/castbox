@@ -1,5 +1,6 @@
 use crate::mutex::Mutex;
 use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
 /// used as wrapper for a pointer to a reference
@@ -7,12 +8,17 @@ use std::ops::{Deref, DerefMut};
 pub struct WatchGuardMut<'a, T: ?Sized> {
     data: &'a mut T,
     lock: Mutex,
+    marker: PhantomData<&'a mut T>,
 }
 
 impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
     pub fn new(ptr: &'mutex mut T, lock: Mutex) -> WatchGuardMut<'mutex, T> {
-        Self { data: ptr, lock }
+        Self {
+            data: ptr,
+            lock,
+            marker: PhantomData,
+        }
     }
 
     pub fn is_locked(&self) -> bool {
@@ -20,20 +26,21 @@ impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     }
 }
 
-/// `T` must be `Sync` for a [`WatchGuardMut<T>`] to be `Sync`
-/// because it is possible to get a `&T` from `&WatchGuard` (via `Deref`).
 unsafe impl<T: ?Sized + Sync> Sync for WatchGuardMut<'_, T> {}
+unsafe impl<T: ?Sized + Send> Send for WatchGuardMut<'_, T> {}
 
 impl<T: ?Sized> Deref for WatchGuardMut<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        debug_assert!(self.lock.is_locked_exclusive(), "{:?}", self.lock);
         &*self.data
     }
 }
 
 impl<T: ?Sized> DerefMut for WatchGuardMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
+        debug_assert!(self.lock.is_locked_exclusive(), "{:?}", self.lock);
         &mut *self.data
     }
 }

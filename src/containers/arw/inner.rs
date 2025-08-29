@@ -1,16 +1,18 @@
 use crate::mutex::Mutex;
 use std::any::Any;
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
 
-/// Max number of reference that an any_ref could have
-pub(super) const MAX_REFCOUNT: usize = isize::MAX as usize;
+/// Max number of reference that an anyref could have
+pub(crate) const MAX_REFCOUNT: usize = isize::MAX as usize;
 
 /// Actually the main worker
 pub(crate) struct ArwInner<T: Sized> {
     pub(crate) lock: Mutex,
     pub(crate) strong: AtomicUsize,
     pub(crate) weak: AtomicUsize,
+    marker: PhantomData<T>,
     pub(crate) val: UnsafeCell<T>,
 }
 
@@ -25,6 +27,7 @@ impl<T> ArwInner<T> {
             lock: Mutex::new(),
             strong: AtomicUsize::new(1),
             weak: AtomicUsize::new(1),
+            marker: PhantomData,
         }
     }
 
@@ -51,6 +54,7 @@ impl<T: Default> Default for ArwInner<T> {
             lock: Mutex::new(),
             strong: AtomicUsize::new(1),
             weak: AtomicUsize::new(1),
+            marker: PhantomData,
         }
     }
 }

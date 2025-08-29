@@ -14,15 +14,14 @@
     unreachable_pub
 )]
 
-mod any_ref;
-mod arw;
+pub mod containers;
+
 pub mod channels;
 pub mod collections;
 pub mod mutex;
 pub mod utils;
 
-pub use any_ref::{AnyRef, WeakAnyRef};
-pub use arw::{Arw, WeakArw};
+pub mod core;
 
 #[cfg(test)]
 mod test;

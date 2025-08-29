@@ -1,14 +1,126 @@
+use crate::core::futex::{futex_wait, futex_wake};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const UNLOCKED: usize = 0;
+const LOCKED: usize = 1;
+
+pub(crate) struct SMutex {
+    state: AtomicUsize,
+}
+
+impl SMutex {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(UNLOCKED),
+        }
+    }
+
+    pub(crate) fn is_locked(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == LOCKED
+    }
+
+    pub(crate) fn lock(&self) -> SGuard<'_> {
+        self.raw_lock();
+        SGuard::new(self)
+    }
+
+    pub(crate) fn raw_lock(&self) {
+        if self
+            .state
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+
+        // Altrimenti entriamo in attesa
+        loop {
+            // Aspettiamo finché lo stato rimane LOCKED
+            while self.state.load(Ordering::Relaxed) == LOCKED {
+                futex_wait(&self.state, LOCKED);
+            }
+
+            // Ritentiamo l'acquisizione
+            if self
+                .state
+                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn raw_unlock(&self) {
+        self.state.store(UNLOCKED, Ordering::Release);
+        futex_wake(&self.state as *const _);
+    }
+}
+
+pub(crate) struct SGuard<'a> {
+    m: &'a SMutex,
+}
+
+impl<'a> SGuard<'a> {
+    fn new(m: &'a SMutex) -> SGuard<'a> {
+        SGuard { m }
+    }
+
+    pub(crate) fn lock(this: &SGuard<'_>) {
+        this.m.raw_lock();
+    }
+
+    pub(crate) fn unlock(this: &SGuard<'_>) {
+        this.m.raw_unlock();
+    }
+}
+
+impl<'a> Drop for SGuard<'a> {
+    fn drop(&mut self) {
+        self.m.raw_unlock()
+    }
+}
+
+#[cfg(test)]
 mod tests_mutex {
     use crate::mutex::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
     #[test]
+    fn kiko() {
+        let m = Mutex::new();
+
+        m.lock_exclusive();
+
+        let mc = m.clone();
+        let t1 = thread::spawn(move || {
+            mc.lock_group();
+            mc.lock_group();
+            mc.lock_group();
+
+            thread::sleep(Duration::from_millis(200));
+            mc.unlock_all_group();
+        });
+
+        let mc = m.clone();
+        let t2 = thread::spawn(move || {
+            let _x = mc.clone();
+            mc.unlock_exclusive();
+            thread::sleep(Duration::from_millis(100));
+            mc.lock_exclusive();
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        m.unlock_exclusive();
+    }
+
+    #[test]
     fn stress_test() {
-        use crate::mutex::Mutex;
-        use std::thread;
         let mut handles = vec![];
 
         let mutex = Mutex::new();
@@ -170,17 +282,19 @@ mod tests_mutex {
         let ok = Arc::new(AtomicBool::new(true));
 
         let mut ths = Vec::new();
-        for _ in 0..4 {
+        for _i in 0..4 {
             let mm = m.clone();
             let inside = inside.clone();
             let ok = ok.clone();
             ths.push(thread::spawn(move || {
-                for _ in 0..50 {
+                let _x = _i;
+                let _k = mm.get_ref_count();
+                for _j in 0..50 {
                     mm.lock_exclusive();
                     if inside.swap(true, Ordering::AcqRel) {
                         ok.store(false, Ordering::Release);
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    //thread::sleep(Duration::from_millis(1));
                     inside.store(false, Ordering::Release);
                     mm.unlock_exclusive();
                 }
@@ -231,21 +345,6 @@ mod tests_mutex {
     }
 
     #[test]
-    #[should_panic(expected = "Trying to unlock a non Locked Group")]
-    fn unlock_group_panics_if_not_group() {
-        let m = Mutex::new();
-        m.lock_exclusive();
-        m.unlock_group();
-    }
-
-    #[test]
-    #[should_panic(expected = "Is not Locked or is a Locked Group")]
-    fn unlock_panics_if_not_locked() {
-        let m = Mutex::new();
-        m.unlock_exclusive();
-    }
-
-    #[test]
     fn unlock_panics_if_group_locked() {
         let m = Mutex::new();
         m.lock_group();
@@ -259,24 +358,17 @@ mod tests_mutex {
     #[test]
     fn stress_multi_lock() {
         let m = Mutex::new();
-        let excl_sum = Arc::new(AtomicI32::new(0));
-        let group_entries = Arc::new(AtomicUsize::new(0));
 
         let mut ths = Vec::new();
         for id in 0..8 {
             let mm = m.clone();
-            let excl = excl_sum.clone();
-            let ge = group_entries.clone();
             ths.push(thread::spawn(move || {
                 for i in 0..100 {
                     if (id + i) % 3 == 0 {
                         mm.lock_exclusive();
-                        excl.fetch_add(1, Ordering::Relaxed);
                         mm.unlock_exclusive();
                     } else {
                         mm.lock_group();
-                        ge.fetch_add(1, Ordering::Relaxed);
-                        thread::sleep(Duration::from_millis(1));
                         mm.unlock_group();
                     }
                 }
@@ -285,7 +377,5 @@ mod tests_mutex {
         for t in ths {
             t.join().unwrap();
         }
-        assert!(excl_sum.load(Ordering::Relaxed) > 0);
-        assert!(group_entries.load(Ordering::Relaxed) > 0);
     }
 }

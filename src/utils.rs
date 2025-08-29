@@ -48,8 +48,8 @@ pub fn wait_until(deadline: Instant, pred: impl Fn() -> bool) -> bool {
         if pred() {
             return true;
         }
-        std::hint::spin_loop();
         thread::yield_now();
+        std::hint::spin_loop();
     }
     false
 }

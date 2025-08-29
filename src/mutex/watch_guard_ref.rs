@@ -1,5 +1,6 @@
 use crate::mutex::Mutex;
 use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::ops::Deref;
 
 /// used as wrapper for a pointer to a reference
@@ -7,16 +8,21 @@ use std::ops::Deref;
 pub struct WatchGuardRef<'a, T: ?Sized> {
     data: &'a T,
     lock: Mutex,
+    marker: PhantomData<&'a T>,
 }
 
 impl<'mutex, T: ?Sized> WatchGuardRef<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
     pub fn new(ptr: &'mutex T, lock: Mutex) -> WatchGuardRef<'mutex, T> {
-        Self { data: ptr, lock }
+        Self {
+            data: ptr,
+            lock,
+            marker: PhantomData,
+        }
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lock.is_locked_exclusive()
+        self.lock.is_locked()
     }
 }
 
@@ -28,6 +34,7 @@ impl<T: ?Sized> Deref for WatchGuardRef<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        debug_assert!(self.lock.is_locked_group(), "{:?}", self.lock);
         &*self.data
     }
 }

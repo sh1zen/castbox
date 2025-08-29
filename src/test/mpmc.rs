@@ -1,4 +1,3 @@
-#[cfg(test)]
 mod tests_mpmc {
     use crate::channels::mpmc::Mpmc;
     use crate::collections::AtomicVec;

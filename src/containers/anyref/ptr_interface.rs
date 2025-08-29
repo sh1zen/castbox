@@ -1,4 +1,4 @@
-use crate::any_ref::inner::AnyRefInner;
+use crate::containers::anyref::inner::AnyRefInner;
 use crate::utils::is_dangling;
 use std::any::Any;
 use std::mem::offset_of;

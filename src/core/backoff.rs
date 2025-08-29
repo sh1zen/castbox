@@ -46,6 +46,10 @@ impl Backoff {
         }
     }
 
+    pub(crate) fn yielder(&self) {
+        self.step.set(SPIN_LIMIT + 1);
+    }
+
     /// Backs off in a blocking loop.
     ///
     /// This method should be used when we need to wait for another thread to make progress.
@@ -79,7 +83,7 @@ impl Backoff {
     /// Returns `true` if exponential backoff has completed the spinning threshold.
     #[inline]
     pub(crate) fn is_yielding(&self) -> bool {
-        self.step.get() > SPIN_LIMIT
+        self.step.get() >= SPIN_LIMIT
     }
 }
 
