@@ -8,11 +8,17 @@ pub(super) const MAX_REFCOUNT: usize = isize::MAX as usize;
 
 /// Actually the main worker of AnyRef
 pub(crate) struct AnyRefInner {
+    // strong ref count
     pub(crate) strong: AtomicUsize,
+    // weak ref count
     pub(crate) weak: AtomicUsize,
+    // data type id
     pub(crate) type_id: TypeId,
+    // actual data on heap
     pub(crate) data: UnsafeCell<Box<dyn Any>>,
+    // type name
     pub(crate) type_name: &'static str,
+    // syncing mechanism for ref access to data
     pub(crate) lock: Mutex,
 }
 

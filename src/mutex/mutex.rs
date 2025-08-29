@@ -5,8 +5,8 @@ use std::sync::atomic;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::thread::Thread;
-use std::{fmt, hint, thread};
 use std::time::Duration;
+use std::{fmt, hint, thread};
 
 pub(crate) enum MutexType {
     Exclusive,
@@ -25,7 +25,7 @@ type State = usize;
 /// unlocked
 const UNLOCKED: State = 0;
 /// locked, no other threads waiting
-const LOCKED: State = 1;
+const LOCKED_EXCLUSIVE: State = 1;
 /// multi group lock
 const LOCKED_GROUP: State = 3;
 /// a dirty state
@@ -88,7 +88,7 @@ impl Mutex {
                     if inner.locked.load(Acquire) == 0 {
                         if inner
                             .state
-                            .compare_exchange(DIRTY, LOCKED, Acquire, Relaxed)
+                            .compare_exchange(DIRTY, LOCKED_EXCLUSIVE, Acquire, Relaxed)
                             .is_ok()
                         {
                             break;
@@ -98,7 +98,7 @@ impl Mutex {
                 _ => {
                     if inner
                         .state
-                        .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
+                        .compare_exchange(UNLOCKED, LOCKED_EXCLUSIVE, Acquire, Relaxed)
                         .is_ok()
                     {
                         break;
@@ -174,13 +174,12 @@ impl Mutex {
 
     #[inline]
     pub fn is_locked_exclusive(&self) -> bool {
-        let state = self.inner().state.load(Acquire);
-        !(state == UNLOCKED || (state == DIRTY && self.inner().locked.load(Acquire) == 0))
+        self.inner().state.load(Acquire) == LOCKED_EXCLUSIVE
     }
 
     #[inline]
     pub fn is_locked(&self) -> bool {
-        self.is_locked_group() || self.is_locked_exclusive()
+        self.inner().state.load(Acquire) != UNLOCKED
     }
 
     #[inline]
@@ -227,10 +226,13 @@ impl Mutex {
         if self
             .inner()
             .state
-            .compare_exchange(LOCKED, UNLOCKED, Release, Relaxed)
+            .compare_exchange(LOCKED_EXCLUSIVE, UNLOCKED, Release, Relaxed)
             .is_err()
         {
-            panic!("Is not Locked or is a Locked Group.");
+            panic!(
+                "Is not Locked or is a Locked Group {}",
+                self.inner().state.load(Acquire)
+            );
         }
 
         // if there are some thread suspended now we must wake them up
@@ -239,24 +241,59 @@ impl Mutex {
         }
     }
 
+    /// non-blocking lock exclusive
     pub fn try_lock_exclusive(&self) -> bool {
         if self.inner().locked.load(Acquire) == 0 {
             return self
                 .inner()
                 .state
-                .compare_exchange(DIRTY, LOCKED, Acquire, Relaxed)
+                .compare_exchange(DIRTY, LOCKED_EXCLUSIVE, Acquire, Relaxed)
                 .is_ok();
         }
 
         self.inner()
             .state
-            .compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed)
+            .compare_exchange(UNLOCKED, LOCKED_EXCLUSIVE, Acquire, Relaxed)
             .is_ok()
+    }
+
+    /// non-blocking lock group
+    pub fn try_lock_group(&self) -> bool {
+        let inner = self.inner();
+        inner.locked.fetch_add(1, Release);
+
+        match inner.state.load(Acquire) {
+            UNLOCKED => {
+                if inner
+                    .state
+                    .compare_exchange(UNLOCKED, LOCKED_GROUP, Acquire, Relaxed)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            LOCKED_GROUP => {
+                return true;
+            }
+            DIRTY => {
+                if inner
+                    .state
+                    .compare_exchange(DIRTY, LOCKED_GROUP, Acquire, Relaxed)
+                    .is_ok()
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        inner.locked.fetch_sub(1, Release);
+        false
     }
 
     #[inline]
     pub(crate) fn suspend(&self, t: MutexType) -> bool {
-        if  self.inner().wake_deadlock.fetch_add(1, SeqCst) == 0 {
+        if self.inner().wake_deadlock.fetch_add(1, SeqCst) == 0 {
             self.inner().wake_deadlock.fetch_sub(1, SeqCst);
             return false;
         }
