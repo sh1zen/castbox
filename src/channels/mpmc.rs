@@ -22,7 +22,7 @@ unsafe impl<T: Send> Send for Mpmc<T> {}
 unsafe impl<T: Sync> Sync for Mpmc<T> {}
 
 impl<T> Mpmc<T> {
-    /// Crea un canale MPMC condiviso mediante Arc.
+    /// create a new unbounded channel
     pub fn new() -> Mpmc<T> {
         let ptr = Box::into_raw(Box::new(MpmcInner {
             buffer: AtomicVec::new(),
@@ -39,6 +39,7 @@ impl<T> Mpmc<T> {
         Self { ptr }
     }
 
+    /// create a new bounded channel
     pub fn bounded(n: usize) -> Mpmc<T> {
         let c = Self::new();
         c.inner_mut().bounded = n;
@@ -56,7 +57,8 @@ impl<T> Mpmc<T> {
         unsafe { &mut *ptr }
     }
 
-    /// Invio non bloccante. Ritorna Err(value) se il canale è chiuso.
+    /// non-blocking send, if closed channel or
+    /// bounded limit overcome an error is returned
     pub fn send(&self, value: T) -> Result<(), T> {
         let inner = self.inner();
 
@@ -64,8 +66,8 @@ impl<T> Mpmc<T> {
             return Err(value);
         }
 
-        if inner.bounded > 0 && inner.buffer.len() >= inner.bounded{
-            return Err(value)
+        if inner.bounded > 0 && inner.buffer.len() >= inner.bounded {
+            return Err(value);
         }
 
         inner.buffer.push(value);
@@ -75,12 +77,12 @@ impl<T> Mpmc<T> {
         Ok(())
     }
 
-    /// Prova a ricevere senza bloccare.
+    /// non-blocking receiver
     pub fn try_recv(&self) -> Option<T> {
         self.inner().buffer.pop()
     }
 
-    /// Riceve bloccando finché non arriva un elemento o il canale è chiuso e vuoto.
+    /// blocking receiver until a data is found or channel closed
     pub fn recv(&self) -> Option<T> {
         loop {
             if let Some(msg) = self.inner().buffer.pop() {
@@ -100,7 +102,7 @@ impl<T> Mpmc<T> {
     /// Chiude il canale: nuovi send falliranno; sveglia tutti i consumer parcheggiati.
     pub fn close(&self) {
         self.inner().closed.store(true, Ordering::Release);
-        // sveglia tutti i consumer affinché possano terminare
+        // wake all consumers to be able to terminate
         self.inner().notify.wake_all(MutexType::Group);
     }
 }
@@ -123,4 +125,3 @@ impl<T> Drop for Mpmc<T> {
         }
     }
 }
-

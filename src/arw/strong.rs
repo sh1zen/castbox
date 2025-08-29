@@ -380,6 +380,7 @@ impl<T: Sized + 'static> From<*mut T> for Arw<T> {
     /// ```
     #[inline]
     fn from(ptr: *mut T) -> Self {
+        assert!(!ptr.is_null(), "pointer must not be null");
         let value = unsafe { ptr::read(ptr) };
         Arw::new(value)
     }
