@@ -7,8 +7,6 @@ mod tests_mutex {
 
     #[test]
     fn stress_test() {
-        use crate::mutex::Mutex;
-        use std::thread;
         let mut handles = vec![];
 
         let mutex = Mutex::new();
