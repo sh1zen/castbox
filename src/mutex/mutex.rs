@@ -90,7 +90,7 @@ impl Mutex {
                             break;
                         }
                     } else {
-                        // Sospendi effettivamente il thread
+                        // we have many running group locks so this thread can sleep
                         if self.suspend(MutexType::Exclusive) {
                             backoff.reset();
                         }
@@ -146,7 +146,7 @@ impl Mutex {
                     }
                 }
                 LOCKED_GROUP => {
-                    // fix data race
+                    // fix some data race
                     let _ = inner.state.load(Acquire);
                     break;
                 }
@@ -188,7 +188,7 @@ impl Mutex {
 
     #[inline]
     pub fn is_locked(&self) -> bool {
-        self.inner().state.load(Acquire) != UNLOCKED
+        self.is_locked_exclusive() || self.is_locked_group()
     }
 
     #[inline]
@@ -304,10 +304,12 @@ impl Mutex {
                     .compare_exchange(UNLOCKED, LOCKED_GROUP, Acquire, Relaxed)
                     .is_ok()
                 {
+                    inner.wakers.fetch_add(1, Release);
                     return true;
                 }
             }
             LOCKED_GROUP => {
+                inner.wakers.fetch_add(1, Release);
                 return true;
             }
             DIRTY => {
@@ -316,6 +318,7 @@ impl Mutex {
                     .compare_exchange(DIRTY, LOCKED_GROUP, Acquire, Relaxed)
                     .is_ok()
                 {
+                    inner.wakers.fetch_add(1, Release);
                     return true;
                 }
             }

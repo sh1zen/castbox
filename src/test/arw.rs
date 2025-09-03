@@ -1,9 +1,9 @@
 mod tests_arw {
-    use crate::mutex::{Mutex, WatchGuardRef};
+    use crate::mutex::WatchGuardRef;
     use crate::{Arw, WeakArw};
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicU8;
     use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    use std::sync::Barrier;
     use std::time::Instant;
     use std::{hint, thread};
 
