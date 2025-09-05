@@ -20,9 +20,8 @@ impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     }
 }
 
-/// `T` must be `Sync` for a [`WatchGuardMut<T>`] to be `Sync`
-/// because it is possible to get a `&T` from `&WatchGuard` (via `Deref`).
-unsafe impl<T: ?Sized + Sync> Sync for WatchGuardMut<'_, T> {}
+// todo unsafe impl<T: ?Sized + Sync> Sync for WatchGuardMut<'_, T> {}
+// todo unsafe impl<T: ?Sized + Send> Send for WatchGuardMut<'_, T> {}
 
 impl<T: ?Sized> Deref for WatchGuardMut<'_, T> {
     type Target = T;

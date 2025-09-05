@@ -21,8 +21,11 @@ pub mod collections;
 pub mod mutex;
 pub mod utils;
 
+pub mod core;
+
 pub use any_ref::{AnyRef, WeakAnyRef};
 pub use arw::{Arw, WeakArw};
 
 #[cfg(test)]
 mod test;
+

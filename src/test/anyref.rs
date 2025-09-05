@@ -8,6 +8,7 @@ mod tests_any_ref {
     use std::thread;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn stress_test_any_ref() {
         let a = AnyRef::new("hello".to_string());
 
