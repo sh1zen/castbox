@@ -59,27 +59,24 @@ impl ThreadParker {
                 break;
             }
 
-            if inner.tokens.load(Ordering::Acquire) > 0 {
-                return;
-            }
-        }
-
-        // transizione PARKING -> PARKED (se fallisce, qualcuno ci ha svegliato)
-        if inner
-            .state
-            .compare_exchange(PARKING, PARKED, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Siamo ufficialmente parcheggiati: chiamiamo park() senza tenere nessun lock
-            if inner.tokens.load(Ordering::Acquire) == 0
-                && thread::current().id() == inner.thread.id()
+            // transizione PARKING -> PARKED (se fallisce, qualcuno ci ha svegliato)
+            if inner
+                .state
+                .compare_exchange(PARKING, PARKED, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
             {
-                thread::park();
-            }
+                // Siamo ufficialmente parcheggiati: chiamiamo park() senza tenere nessun lock
+                if inner.tokens.load(Ordering::Acquire) == 0
+                    && thread::current().id() == inner.thread.id()
+                {
+                    thread::park();
+                }
 
-            // al wake: dobbiamo pulire lo stato
-            // proviamo a fare PARKED -> EMPTY; se fallisce, probabilmente l'unparker ha già fatto il lavoro.
-            inner.state.store(RUNNING, Ordering::Release);
+                // al wake: dobbiamo pulire lo stato
+                // proviamo a fare PARKED -> EMPTY; se fallisce, probabilmente l'unparker ha già fatto il lavoro.
+                inner.state.store(RUNNING, Ordering::Release);
+                break;
+            }
         }
     }
 
@@ -94,6 +91,7 @@ impl ThreadParker {
                 PARKED => {
                     inner.thread.unpark();
                     Self::spin_loop(20);
+                    break;
                 }
                 RUNNING => {
                     break;
@@ -135,8 +133,6 @@ impl Drop for ThreadParker {
 #[cfg(test)]
 mod tests_thread {
     use super::*;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     #[test]
     fn test_unpark_before_park() {
@@ -147,16 +143,24 @@ mod tests_thread {
 
     #[test]
     fn test_unpark_after_park() {
-        let parker = Arc::new(ThreadParker::new());
-
-        let pc = parker.clone();
         let t = thread::spawn(move || {
-            pc.park();
+            let parker = ThreadParker::new();
+
+            let pc = parker.clone();
+            let t = thread::spawn(move || {
+                for _ in 0..120 {
+                    pc.unpark();
+                }
+            });
+
+            for _ in 0..100 {
+                parker.park();
+            }
+
+            t.join().unwrap();
+
             123
         });
-
-        thread::sleep(Duration::from_millis(100));
-        parker.unpark();
 
         assert_eq!(t.join().unwrap(), 123);
     }
