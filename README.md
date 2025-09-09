@@ -8,19 +8,19 @@
 
 ---
 
-## ✨ AtomicVec — Lock-Free Atomic Vector for Rust
+## ✨ AtomicVec — Lock-Free Atomic Vector
 
 **AtomicVec** is a lock-free, thread-safe vector in Rust designed for high-concurrency environments. It supports atomic push and pop operations with minimal blocking, maintaining safe memory management through ManuallyDrop and reference counting.
 
 - 🧠 Suitable for implementing queues, stacks, and other dynamic collections
 
-## ✨ AtomicHashMap — Lock-Free Concurrent Hash Map for Rust
+## ✨ AtomicHashMap — Lock-Free Concurrent Hash Map 
 
 **AtomicHashMap** is a thread-safe, concurrent hash map in Rust that supports high-performance insertion, retrieval, and removal of key-value pairs. It uses fine-grained atomic operations combined with internal mutexes to manage contention efficiently.
 
 - 🧠 Ideal for shared caches, state maps, and runtime-managed data
 
-## ✨ AtomicChain — Lock-Free Concurrent Multi value Hash Map for Rust
+## ✨ AtomicChain — Lock-Free Concurrent Multi value Hash Map 
 
 **AtomicChain** is a high-performance, thread-safe key-value store implemented in Rust. It is designed for concurrent access without blocking, using fine-grained atomic operations and internal mutexes to manage contention.
 
@@ -33,18 +33,24 @@
 
 - 🧠 Suitable for shared data structures, caches, and custom concurrent primitives
 
-## ✨ AnyRef — Runtime-Typed Reference-Counted Smart Pointer for Rust
+## ✨ AnyRef — Runtime-Typed Reference-Counted Smart Pointer 
 
 **AnyRef** is a custom smart pointer similar to `Arc`, designed for storing dynamically typed (`dyn Any`) values with strong and weak reference support, runtime downcasting, and optional thread-safe interior mutability.  
 It is ideal for scenarios where type erasure and runtime polymorphism are needed without exposing generic interfaces.
 
 - 🧠 Safe runtime downcasting (`try_downcast`, `try_downcast_mut`)
 
-## ✨ Mutex — User-Space Fast Mutex for Rust
+## ✨ Mutex — User-Space Fast Mutex 
 
 **Mutex** is a high-performance user-space mutex supporting exclusive and group locks. Built on atomic primitives and exponential backoff, it minimizes kernel-level contention while providing safe multi-threaded access control.
 
 - 🧠 Suitable for performance-critical synchronization scenarios
+
+## ✨ Barrier — Thread Synchronization Primitive 
+
+**Barrier** is a lightweight, thread-safe synchronization primitive in Rust that coordinates groups of threads. It blocks threads until a specified number of waiters arrive, then releases them all simultaneously. Once released, the barrier resets to a configurable capacity (bucket) for reuse.
+
+- 🧠 Suitable for parallel algorithms, phased execution, and workload synchronization
 
 ---
 
@@ -167,7 +173,7 @@ Open your Cargo.toml and add:
 
 ```toml
 [dependencies]
-castbox = "0.0.11" # or the latest version available 
+castbox = "0.0.12" # or the latest version available 
 ```
 ---
 

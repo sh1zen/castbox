@@ -2,7 +2,7 @@ use crate::core::scondvar::SCondVar;
 use crate::core::smutex::{SGuard, SMutex};
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::thread;
 use std::time::Duration;
 
@@ -115,22 +115,19 @@ impl Mutex {
         let d = self.inner().data(&guard);
         d.state
     }
-    
+
     pub fn lock_exclusive(&self) {
         let mut guard = self.inner().state_mutex.lock();
-        {
-            let d = self.inner().data(&guard);
-            d.wakers = d.wakers.saturating_add(1);
-        }
+
+        let d = self.inner().data(&guard);
+        d.wakers = d.wakers.saturating_add(1);
 
         loop {
-            {
-                let d = self.inner().data(&guard);
-                if d.state == UNLOCKED || (d.state == DIRTY && d.g_locked == 0) {
-                    d.state = LOCKED_EXCLUSIVE;
-                    d.wakers = d.wakers.saturating_sub(1);
-                    break;
-                }
+            let d = self.inner().data(&guard);
+            if d.state == UNLOCKED || (d.state == DIRTY && d.g_locked == 0) {
+                d.state = LOCKED_EXCLUSIVE;
+                d.wakers = d.wakers.saturating_sub(1);
+                break;
             }
 
             guard = self.inner().cvar_exclusive.wait(guard);
