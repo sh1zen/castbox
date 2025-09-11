@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-pub(crate) enum GmutexType {
+pub(crate) enum GrutexType {
     Exclusive,
     Group,
 }
@@ -41,7 +41,7 @@ fn decode_group_state(st: State) -> Option<usize> {
 }
 
 struct StateData {
-    // stato canonico (usato quando si tiene il Gmutex)
+    // stato canonico (usato quando si tiene il Grutex)
     state: State,
     // numero di thread attualmente 'in attesa' (come nella logica originale)
     wakers: usize,
@@ -50,8 +50,8 @@ struct StateData {
     // Nota: non teniamo qui total_g_locked (è atomico nella struttura principale)
 }
 
-struct InnerGmutex {
-    state_gmutex: SMutex,
+struct InnerGrutex {
+    state_grutex: SMutex,
     data: UnsafeCell<StateData>,
 
     // condvar globale per notifiche su tutti i gruppi (usata quando serve "tutti")
@@ -63,19 +63,19 @@ struct InnerGmutex {
     ref_count: AtomicUsize,
 
     // primitive atomiche per letture hot-path:
-    // - state_atomic riflette lo stesso valore di `state` (ma può essere letto senza Gmutex)
+    // - state_atomic riflette lo stesso valore di `state` (ma può essere letto senza Grutex)
     // - total_g_locked_atomic tiene il conteggio totale dei lockers di gruppo (somma su counts)
     state_atomic: AtomicUsize,
     total_g_locked_atomic: AtomicUsize,
 }
 
-unsafe impl Send for InnerGmutex {}
-unsafe impl Sync for InnerGmutex {}
+unsafe impl Send for InnerGrutex {}
+unsafe impl Sync for InnerGrutex {}
 
-impl InnerGmutex {
+impl InnerGrutex {
     fn new() -> Self {
         Self {
-            state_gmutex: SMutex::new(),
+            state_grutex: SMutex::new(),
             data: UnsafeCell::new(StateData {
                 state: UNLOCKED,
                 wakers: 0,
@@ -96,7 +96,7 @@ impl InnerGmutex {
     }
 
     /// Ensure vectors are large enough for index `n`.
-    /// Must be called under state_gmutex lock.
+    /// Must be called under state_grutex lock.
     #[inline]
     fn ensure_group_capacity(&self, n: usize) {
         let counts = unsafe { &mut (*self.data.get()).counts };
@@ -119,7 +119,7 @@ impl InnerGmutex {
         }
     }
 
-    /// get or create a Arc<SCondVar> for group n — must hold Gmutex
+    /// get or create a Arc<SCondVar> for group n — must hold Grutex
     #[inline]
     fn get_or_create_group_cvar_arc(&self, n: usize) -> Arc<SCondVar> {
         let vec = unsafe { &mut *self.group_cvars.get() };
@@ -152,7 +152,7 @@ impl InnerGmutex {
         }
     }
 
-    /// notify_all over all group condvars; must be called under Gmutex.
+    /// notify_all over all group condvars; must be called under Grutex.
     #[inline]
     fn notify_all_group_cvars(&self) {
         let vec = unsafe { &mut *self.group_cvars.get() };
@@ -165,27 +165,27 @@ impl InnerGmutex {
 }
 
 #[repr(transparent)]
-pub struct Gmutex {
-    ptr: *const InnerGmutex,
+pub struct Grutex {
+    ptr: *const InnerGrutex,
 }
 
-unsafe impl Send for Gmutex {}
-unsafe impl Sync for Gmutex {}
+unsafe impl Send for Grutex {}
+unsafe impl Sync for Grutex {}
 
-impl std::panic::UnwindSafe for Gmutex {}
-impl std::panic::RefUnwindSafe for Gmutex {}
+impl std::panic::UnwindSafe for Grutex {}
+impl std::panic::RefUnwindSafe for Grutex {}
 
-impl Gmutex {
+impl Grutex {
     pub fn new() -> Self {
-        let ptr = Box::into_raw(Box::new(InnerGmutex::new()));
+        let ptr = Box::into_raw(Box::new(InnerGrutex::new()));
         if ptr.is_null() {
-            panic!("Happened an invalid allocation for Gmutex");
+            panic!("Happened an invalid allocation for Grutex");
         }
         Self { ptr }
     }
 
     #[inline]
-    fn inner(&self) -> &InnerGmutex {
+    fn inner(&self) -> &InnerGrutex {
         unsafe { &*self.ptr }
     }
 
@@ -201,7 +201,7 @@ impl Gmutex {
     /// ritorna il conteggio di locker per uno specifico tipo `n`
     /// questa richiede il lock (perché i contatori per tipo sono nel Vec)
     pub fn get_group_locked_for(&self, n: usize) -> usize {
-        let guard = self.inner().state_gmutex.lock();
+        let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
         if n < d.counts.len() { d.counts[n] } else { 0 }
     }
@@ -234,7 +234,7 @@ impl Gmutex {
     }
 
     pub fn lock_exclusive(&self) {
-        let mut guard = self.inner().state_gmutex.lock();
+        let mut guard = self.inner().state_grutex.lock();
 
         loop {
             {
@@ -256,9 +256,9 @@ impl Gmutex {
 
     /// lock di gruppo per il tipo `n`
     pub fn lock_group(&self, n: usize) {
-        let mut guard = self.inner().state_gmutex.lock();
+        let mut guard = self.inner().state_grutex.lock();
 
-        // ensure capacity (single resize path under Gmutex)
+        // ensure capacity (single resize path under Grutex)
         self.inner().ensure_group_capacity(n);
 
         {
@@ -269,7 +269,7 @@ impl Gmutex {
             // incrementa contatore per quel tipo (O(1, no hash)
             d.counts[n] = d.counts[n].saturating_add(1);
 
-            // incrementa il contatore totale atomico (solo qui, sotto Gmutex)
+            // incrementa il contatore totale atomico (solo qui, sotto Grutex)
             self.inner().total_g_locked_atomic.fetch_add(1, AcqRel);
         }
 
@@ -317,7 +317,7 @@ impl Gmutex {
 
     /// unlock di gruppo per il tipo `n`
     pub fn unlock_group(&self, n: usize) {
-        let guard = self.inner().state_gmutex.lock();
+        let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
 
         if d.state != LOCKED_GROUP && decode_group_state(d.state).is_none() && d.state != DIRTY {
@@ -400,7 +400,7 @@ impl Gmutex {
 
     /// unlock exclusive
     pub fn unlock_exclusive(&self) {
-        let guard = self.inner().state_gmutex.lock();
+        let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
 
         if d.state != LOCKED_EXCLUSIVE {
@@ -431,7 +431,7 @@ impl Gmutex {
             }
         }
 
-        // aggiorna l'atomico dopo la modifica canonica sotto Gmutex
+        // aggiorna l'atomico dopo la modifica canonica sotto Grutex
         self.inner().state_atomic.store(d.state, Release);
 
         d.wakers = d.wakers.saturating_sub(1);
@@ -446,7 +446,7 @@ impl Gmutex {
     /// - Some(n): azzera solo il gruppo n
     /// - None: azzera tutti i gruppi (comportamento 'tutti')
     pub fn unlock_all_group(&self, target: Option<usize>) {
-        let guard = self.inner().state_gmutex.lock();
+        let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
 
         if d.state != LOCKED_GROUP && decode_group_state(d.state).is_none() && d.state != DIRTY {
@@ -520,18 +520,18 @@ impl Gmutex {
 
     /// sospende un thread in attesa per Exclusive o Group.
     /// Se `group_id` è Some(n), aspetta sulla condvar del gruppo n; altrimenti sulla condvar globale.
-    pub(crate) fn suspend(&self, t: GmutexType, group_id: Option<usize>) -> bool {
-        let guard = self.inner().state_gmutex.lock();
+    pub(crate) fn suspend(&self, t: GrutexType, group_id: Option<usize>) -> bool {
+        let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
         if d.wakers == 0 {
             return false;
         }
 
         match t {
-            GmutexType::Exclusive => {
+            GrutexType::Exclusive => {
                 let _ = self.inner().cvar_exclusive.wait(guard);
             }
-            GmutexType::Group => {
+            GrutexType::Group => {
                 match group_id {
                     Some(n) => {
                         // prendi Arc qui (sotto lock) e poi aspetta su di essa
@@ -556,10 +556,10 @@ impl Gmutex {
     }
 
     /// wake_all: se Some(n) => risveglia solo la condvar del gruppo n, altrimenti tutte le condvar di gruppo
-    pub(crate) fn wake_all(&self, t: GmutexType, group_id: Option<usize>) {
+    pub(crate) fn wake_all(&self, t: GrutexType, group_id: Option<usize>) {
         match t {
-            GmutexType::Exclusive => self.inner().cvar_exclusive.notify_all(),
-            GmutexType::Group => {
+            GrutexType::Exclusive => self.inner().cvar_exclusive.notify_all(),
+            GrutexType::Group => {
                 match group_id {
                     Some(n) => {
                         if let Some(gcv_arc) = self.inner().get_group_cvar_if_exists_arc(n) {
@@ -579,13 +579,13 @@ impl Gmutex {
     }
 
     /// wake: se Some(n) => notify_one sul gruppo n, altrimenti notify_one sulla condvar globale o su una per-group
-    pub(crate) fn wake(&self, t: GmutexType, group_id: Option<usize>) -> bool {
+    pub(crate) fn wake(&self, t: GrutexType, group_id: Option<usize>) -> bool {
         match t {
-            GmutexType::Exclusive => {
+            GrutexType::Exclusive => {
                 self.inner().cvar_exclusive.notify_one();
                 true
             }
-            GmutexType::Group => match group_id {
+            GrutexType::Group => match group_id {
                 Some(n) => {
                     if let Some(gcv_arc) = self.inner().get_group_cvar_if_exists_arc(n) {
                         gcv_arc.notify_one();
@@ -608,30 +608,30 @@ impl Gmutex {
     }
 }
 
-impl Clone for Gmutex {
+impl Clone for Grutex {
     fn clone(&self) -> Self {
         self.inner().ref_count.fetch_add(1, Relaxed);
-        Gmutex { ptr: self.ptr }
+        Grutex { ptr: self.ptr }
     }
 }
 
-impl Drop for Gmutex {
+impl Drop for Grutex {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, AcqRel) == 1 {
             fence(Acquire);
-            let ptr = self.ptr as *mut InnerGmutex;
+            let ptr = self.ptr as *mut InnerGrutex;
             unsafe { drop(Box::from_raw(ptr)) };
         }
     }
 }
 
-impl fmt::Debug for Gmutex {
+impl fmt::Debug for Grutex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // per Debug siamo ok ad acquisire il Gmutex (operazione infrequente)
-        let guard = self.inner().state_gmutex.lock();
+        // per Debug siamo ok ad acquisire il Grutex (operazione infrequente)
+        let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
         let total = self.inner().total_g_locked_atomic.load(Acquire);
-        f.debug_struct("Gmutex")
+        f.debug_struct("Grutex")
             .field("state", &d.state)
             .field("exclusive", &(d.state == LOCKED_EXCLUSIVE))
             .field(
