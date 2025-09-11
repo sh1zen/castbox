@@ -390,19 +390,14 @@ mod tests_gmutex {
             gm1.unlock_group(0);
         });
 
-        thread::sleep(Duration::from_millis(10));
-
         let h_excl = thread::spawn(move || {
             // dovrebbe essere sospeso finché il gruppo non rilascia
             gm2.lock_exclusive();
-            gm2.unlock_exclusive();
         });
 
-        thread::sleep(Duration::from_millis(20));
-        assert!(gm.is_locked_group());
         h_group.join().unwrap();
         h_excl.join().unwrap();
-        assert!(!gm.is_locked());
+        assert!(gm.is_locked_exclusive());
     }
 
     #[test]

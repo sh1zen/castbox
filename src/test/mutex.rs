@@ -1,4 +1,3 @@
-
 #[cfg(test)]
 mod tests_mutex {
     use crate::mutex::Mutex;

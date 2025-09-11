@@ -1,8 +1,8 @@
-use crate::core::scondvar::SCondVar;
-use crate::core::smutex::{SGuard, SMutex};
-use std::cell::UnsafeCell;
+use crate::core::smutex::SMutex;
+use crate::core::thread::{ThreadParker, Unparker};
+use crate::collections::AtomicVec;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering, fence};
+use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -13,22 +13,35 @@ pub(crate) enum MutexType {
 
 type State = usize;
 
-const UNLOCKED: State = 0;
-const LOCKED_EXCLUSIVE: State = 1;
-const LOCKED_GROUP: State = 2;
-const DIRTY: State = 3;
+const READERS_PARKED: State = 0b0001;
+const WRITERS_PARKED: State = 0b0010;
+const ONE_READER: State = 0b0100;
+const ONE_WRITER: State = !(READERS_PARKED | WRITERS_PARKED);
 
-struct StateData {
-    state: State,
-    wakers: usize,
-    g_locked: usize,
+#[inline]
+fn is_writer_locked(state: State) -> bool {
+    (state & ONE_WRITER) == ONE_WRITER
+}
+
+#[inline]
+fn reader_count(state: State) -> usize {
+    if is_writer_locked(state) {
+        0
+    } else {
+        (state & ONE_WRITER) >> 2
+    }
 }
 
 struct InnerMutex {
-    state_mutex: SMutex,
-    data: UnsafeCell<StateData>,
-    cvar_exclusive: SCondVar,
-    cvar_group: SCondVar,
+    /// Atomic state: reader count in multiples of ONE_READER; flags in low bits; writer-locked is ONE_WRITER (+ optional flags)
+    state: AtomicUsize,
+    /// Small mutex protecting wait queues only (not the main state)
+    wait_mutex: SMutex,
+    /// Queue of waiters for group (shared) lock
+    readers_waiters: AtomicVec<Unparker>,
+    /// Queue of waiters for exclusive lock
+    writers_waiters: AtomicVec<Unparker>,
+    /// Reference count for outer Mutex clones
     ref_count: AtomicUsize,
 }
 
@@ -38,22 +51,14 @@ unsafe impl Sync for InnerMutex {}
 impl InnerMutex {
     fn new() -> Self {
         Self {
-            state_mutex: SMutex::new(),
-            data: UnsafeCell::new(StateData {
-                state: UNLOCKED,
-                wakers: 0,
-                g_locked: 0,
-            }),
-            cvar_exclusive: SCondVar::new(),
-            cvar_group: SCondVar::new(),
+            state: AtomicUsize::new(0),
+            wait_mutex: SMutex::new(),
+            readers_waiters: AtomicVec::new(),
+            writers_waiters: AtomicVec::new(),
             ref_count: AtomicUsize::new(1),
         }
     }
 
-    #[inline]
-    fn data<'a>(&'a self, _guard: &'a SGuard<'a>) -> &'a mut StateData {
-        unsafe { &mut *self.data.get() }
-    }
 }
 
 #[repr(transparent)]
@@ -76,6 +81,7 @@ impl Mutex {
         Self { ptr }
     }
 
+    #[inline]
     fn inner(&self) -> &InnerMutex {
         unsafe { &*self.ptr }
     }
@@ -85,156 +91,278 @@ impl Mutex {
     }
 
     pub fn get_group_locked(&self) -> usize {
-        let guard = self.inner().state_mutex.lock();
-        let d = self.inner().data(&guard);
-        d.g_locked
+        let s = self.inner().state.load(Ordering::Acquire);
+        reader_count(s)
     }
 
     pub fn is_locked_group(&self) -> bool {
-        let guard = self.inner().state_mutex.lock();
-        let d = self.inner().data(&guard);
-        d.state == LOCKED_GROUP || (d.state == DIRTY && d.g_locked > 0)
+        let s = self.inner().state.load(Ordering::Relaxed);
+        !is_writer_locked(s) && reader_count(s) > 0
     }
 
     pub fn is_locked_exclusive(&self) -> bool {
-        let guard = self.inner().state_mutex.lock();
-        let d = self.inner().data(&guard);
-        d.state == LOCKED_EXCLUSIVE
+        let s = self.inner().state.load(Ordering::Relaxed);
+        is_writer_locked(s)
     }
 
     pub fn is_locked(&self) -> bool {
-        let guard = self.inner().state_mutex.lock();
-        let d = self.inner().data(&guard);
-        d.state == LOCKED_EXCLUSIVE
-            || d.state == LOCKED_GROUP
-            || (d.state == DIRTY && d.g_locked > 0)
+        let s = self.inner().state.load(Ordering::Relaxed);
+        is_writer_locked(s) || reader_count(s) > 0
     }
 
+    #[inline]
     fn spin(&self, _spin: usize) -> State {
-        let guard = self.inner().state_mutex.lock();
-        let d = self.inner().data(&guard);
-        d.state
+        self.inner().state.load(Ordering::Relaxed)
     }
 
     pub fn lock_exclusive(&self) {
-        let mut guard = self.inner().state_mutex.lock();
+        let st = &self.inner().state;
+        if st
+            .compare_exchange(0, ONE_WRITER, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        self.lock_exclusive_slow();
+    }
 
-        let d = self.inner().data(&guard);
-        d.wakers = d.wakers.saturating_add(1);
-
+    fn lock_exclusive_slow(&self) {
+        let inner = self.inner();
         loop {
-            let d = self.inner().data(&guard);
-            if d.state == UNLOCKED || (d.state == DIRTY && d.g_locked == 0) {
-                d.state = LOCKED_EXCLUSIVE;
-                d.wakers = d.wakers.saturating_sub(1);
-                break;
+            // Try to acquire if no readers and no writer (only flags allowed)
+            let mut state = inner.state.load(Ordering::Relaxed);
+            // Quick path: if upper bits are zero (no readers/writer)
+            while (state & ONE_WRITER) == 0 {
+                let desired = ONE_WRITER | (state & (READERS_PARKED | WRITERS_PARKED));
+                match inner.state.compare_exchange_weak(
+                    state,
+                    desired,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(s) => state = s,
+                }
             }
 
-            guard = self.inner().cvar_exclusive.wait(guard);
+            // Ensure WRITERS_PARKED is set
+            if state & WRITERS_PARKED == 0 {
+                if inner
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state | WRITERS_PARKED,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    // try again with new observed state
+                    continue;
+                }
+            }
+
+            // Park current thread in writers queue
+            let (parker, unparker) = ThreadParker::new();
+            {
+                let _g = inner.wait_mutex.lock();
+                inner.writers_waiters.push(unparker);
+            }
+            parker.park();
+            // try again
         }
     }
 
     pub fn lock_group(&self) {
-        let mut guard = self.inner().state_mutex.lock();
-        {
-            let d = self.inner().data(&guard);
-            d.wakers = d.wakers.saturating_add(1);
-            d.g_locked = d.g_locked.saturating_add(1);
+        if self.try_lock_shared_fast() {
+            return;
         }
+        self.lock_shared_slow();
+    }
 
+    #[inline(always)]
+    fn try_lock_shared_fast(&self) -> bool {
+        let inner = self.inner();
+        let state = inner.state.load(Ordering::Relaxed);
+        if let Some(new_state) = state.checked_add(ONE_READER) {
+            if (new_state & ONE_WRITER) != ONE_WRITER {
+                return inner
+                    .state
+                    .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok();
+            }
+        }
+        false
+    }
+
+    fn lock_shared_slow(&self) {
+        let inner = self.inner();
         loop {
-            {
-                let d = self.inner().data(&guard);
-                if d.state == UNLOCKED || d.state == LOCKED_GROUP || d.state == DIRTY {
-                    if d.state == UNLOCKED || d.state == DIRTY {
-                        d.state = LOCKED_GROUP;
-                        self.inner().cvar_group.notify_all();
-                    }
-                    let d = self.inner().data(&guard);
-                    d.wakers = d.wakers.saturating_sub(1);
+            // Try to acquire shared quickly
+            let mut state = inner.state.load(Ordering::Relaxed);
+            // Attempt to add a reader while no writer locked
+            while let Some(new_state) = state.checked_add(ONE_READER) {
+                if (new_state & ONE_WRITER) == ONE_WRITER {
                     break;
                 }
+                if inner
+                    .state
+                    .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return;
+                }
+                state = inner.state.load(Ordering::Relaxed);
             }
 
-            guard = self.inner().cvar_group.wait(guard);
+            // Set READERS_PARKED if not set
+            let observed = inner.state.load(Ordering::Relaxed);
+            if observed & READERS_PARKED == 0 {
+                let _ = inner.state.compare_exchange_weak(
+                    observed,
+                    observed | READERS_PARKED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+
+            // Park current thread in readers queue
+            let (parker, unparker) = ThreadParker::new();
+            {
+                let _g = inner.wait_mutex.lock();
+                inner.readers_waiters.push(unparker);
+            }
+            parker.park();
+            // retry loop
         }
     }
 
     pub fn unlock_group(&self) {
-        let guard = self.inner().state_mutex.lock();
-        {
-            let d = self.inner().data(&guard);
-            if d.state != LOCKED_GROUP && d.state != DIRTY {
-                panic!("Trying to unlock a non Locked Group {}", d.state);
-            }
-
-            d.wakers = d.wakers.saturating_sub(1);
-            d.g_locked = d.g_locked.saturating_sub(1);
-
-            if d.g_locked == 0 {
-                d.state = DIRTY;
-
-                self.inner().cvar_exclusive.notify_one();
-                self.inner().cvar_group.notify_all();
+        let inner = self.inner();
+        let prev = inner.state.fetch_sub(ONE_READER, Ordering::Release);
+        // If this was the last reader and writers are parked, wake one writer.
+        if prev == (ONE_READER | WRITERS_PARKED) {
+            // Attempt to clear WRITERS_PARKED -> 0
+            if inner
+                .state
+                .compare_exchange(WRITERS_PARKED, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Wake a single writer
+                let to_wake;
+                {
+                    let _g = inner.wait_mutex.lock();
+                    to_wake = inner.writers_waiters.pop();
+                }
+                if let Some(u) = to_wake {
+                    u.unpark();
+                }
             }
         }
     }
 
     pub fn unlock_exclusive(&self) {
-        let guard = self.inner().state_mutex.lock();
+        let inner = self.inner();
+        // Fast path: no one is waiting
+        if inner
+            .state
+            .compare_exchange(ONE_WRITER, 0, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
         {
-            let d = self.inner().data(&guard);
-            if d.state != LOCKED_EXCLUSIVE {
-                panic!("Is not Locked Exclusive (state = {})", d.state);
-            }
-
-            d.state = UNLOCKED;
-            d.wakers = d.wakers.saturating_sub(1);
-
-            self.inner().cvar_group.notify_all();
-            self.inner().cvar_exclusive.notify_one();
+            return;
         }
+        self.unlock_exclusive_slow();
+    }
+
+    fn unlock_exclusive_slow(&self) {
+        let inner = self.inner();
+        let state = inner.state.load(Ordering::Relaxed);
+        debug_assert!(
+            is_writer_locked(state),
+            "Is not Locked Exclusive (state = {state})"
+        );
+
+        let parked = state & (READERS_PARKED | WRITERS_PARKED);
+
+        if parked != (READERS_PARKED | WRITERS_PARKED) {
+            if let Err(new_state) =
+                inner
+                    .state
+                    .compare_exchange(state, 0, Ordering::Release, Ordering::Relaxed)
+            {
+                // another waiter might have set both flags; treat as both parked
+                let _ = new_state; // silence warning
+            } else {
+                // we cleared state to 0; wake according to parked
+                if parked == READERS_PARKED {
+                    self.unpark_all_readers();
+                    return;
+                } else {
+                    self.unpark_one_writer();
+                    return;
+                }
+            }
+        }
+
+        // both parked: let readers proceed first, keep WRITERS_PARKED set
+        inner.state.store(WRITERS_PARKED, Ordering::Release);
+        self.unpark_all_readers();
     }
 
     pub fn unlock_all_group(&self) {
-        let guard = self.inner().state_mutex.lock();
-        {
-            let d = self.inner().data(&guard);
-            if d.state != LOCKED_GROUP && d.state != DIRTY {
-                panic!("Trying to unlock a non Locked Group {}", d.state);
+        let inner = self.inner();
+        // Clear all readers (forcefully), keep only parked flags
+        loop {
+            let s = inner.state.load(Ordering::Relaxed);
+            if is_writer_locked(s) {
+                // if writer is locked, nothing to clear for readers
+                break;
             }
-
-            let prev = d.g_locked;
-            d.g_locked = 0;
-            if d.state == LOCKED_GROUP {
-                d.state = DIRTY;
+            let flags = s & (READERS_PARKED | WRITERS_PARKED);
+            if (s & ONE_WRITER) == flags {
+                break; // already no readers
             }
-            d.wakers = d.wakers.saturating_sub(prev);
+            if inner
+                .state
+                .compare_exchange(s, flags, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
         }
-
-        self.inner().cvar_exclusive.notify_one();
-        self.inner().cvar_group.notify_all();
+        // Wake one writer if parked and all readers cleared
+        self.unpark_one_writer();
+        // Also wake all readers in case batches are waiting
+        self.unpark_all_readers();
     }
 
     pub(crate) fn suspend(&self, t: MutexType) -> bool {
-        let guard = self.inner().state_mutex.lock();
-        {
-            let d = self.inner().data(&guard);
-            if d.wakers == 0 {
-                return false;
-            }
-        }
-
         match t {
             MutexType::Exclusive => {
-                let _ = self.inner().cvar_exclusive.wait(guard);
+                if self.inner().state.load(Ordering::Relaxed) & WRITERS_PARKED == 0 {
+                    return false;
+                }
+                let (parker, unparker) = ThreadParker::new();
+                {
+                    let _g = self.inner().wait_mutex.lock();
+                    self.inner().writers_waiters.push(unparker);
+                }
+                parker.park();
+                true
             }
             MutexType::Group => {
-                let _ = self.inner().cvar_group.wait(guard);
+                if self.inner().state.load(Ordering::Relaxed) & READERS_PARKED == 0 {
+                    return false;
+                }
+                let (parker, unparker) = ThreadParker::new();
+                {
+                    let _g = self.inner().wait_mutex.lock();
+                    self.inner().readers_waiters.push(unparker);
+                }
+                parker.park();
+                true
             }
         }
-
-        true
     }
 
     pub(crate) fn pause(&self, timeout: Duration) {
@@ -243,21 +371,57 @@ impl Mutex {
 
     pub(crate) fn wake_all(&self, t: MutexType) {
         match t {
-            MutexType::Exclusive => self.inner().cvar_exclusive.notify_all(),
-            MutexType::Group => self.inner().cvar_group.notify_all(),
+            MutexType::Exclusive => self.unpark_one_writer(), // semantics: wake one writer (exclusive queue is FIFO-ish)
+            MutexType::Group => self.unpark_all_readers(),
         }
     }
 
     pub(crate) fn wake(&self, t: MutexType) -> bool {
         match t {
             MutexType::Exclusive => {
-                self.inner().cvar_exclusive.notify_one();
+                self.unpark_one_writer();
                 true
             }
             MutexType::Group => {
-                self.inner().cvar_group.notify_one();
+                self.unpark_all_readers();
                 true
             }
+        }
+    }
+
+    #[inline]
+    fn unpark_all_readers(&self) {
+        let inner = self.inner();
+        // Detach the readers queue under the small wait_mutex to avoid races with suspend
+        let to_wake_iter = {
+            let _g = inner.wait_mutex.lock();
+            let it = inner.readers_waiters.drain();
+            // Clear READERS_PARKED flag if queue is empty
+            if it.is_none() {
+                let _ = inner.state.fetch_and(!READERS_PARKED, Ordering::Relaxed);
+            }
+            it
+        };
+        if let Some(iter) = to_wake_iter {
+            for u in iter {
+                u.unpark();
+            }
+        }
+    }
+
+    #[inline]
+    fn unpark_one_writer(&self) {
+        let inner = self.inner();
+        let one;
+        {
+            let _g = inner.wait_mutex.lock();
+            one = inner.writers_waiters.pop();
+            if one.is_none() {
+                let _ = inner.state.fetch_and(!WRITERS_PARKED, Ordering::Relaxed);
+            }
+        }
+        if let Some(u) = one {
+            u.unpark();
         }
     }
 }
@@ -281,12 +445,11 @@ impl Drop for Mutex {
 
 impl fmt::Debug for Mutex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.inner().state_mutex.lock();
-        let d = self.inner().data(&guard);
+        let s = self.inner().state.load(Ordering::Relaxed);
         f.debug_struct("Mutex")
-            .field("exclusive", &(d.state == LOCKED_EXCLUSIVE))
-            .field("group", &(d.state == LOCKED_GROUP || d.state == DIRTY))
-            .field("lockers", &d.g_locked)
+            .field("exclusive", &is_writer_locked(s))
+            .field("group", &(reader_count(s) > 0))
+            .field("lockers", &reader_count(s))
             .field("ref", &self.get_ref_count())
             .finish()
     }
