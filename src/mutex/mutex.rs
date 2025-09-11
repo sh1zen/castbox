@@ -115,6 +115,7 @@ impl Mutex {
         self.inner().state.load(Ordering::Relaxed)
     }
 
+    #[inline(always)]
     pub fn lock_exclusive(&self) {
         let st = &self.inner().state;
         if st
@@ -126,6 +127,7 @@ impl Mutex {
         self.lock_exclusive_slow();
     }
 
+    #[cold]
     fn lock_exclusive_slow(&self) {
         let inner = self.inner();
         loop {
@@ -145,22 +147,31 @@ impl Mutex {
                 }
             }
 
-            // Ensure WRITERS_PARKED is set
-            if state & WRITERS_PARKED == 0 {
-                if inner
-                    .state
-                    .compare_exchange_weak(
-                        state,
-                        state | WRITERS_PARKED,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    )
-                    .is_err()
-                {
-                    // try again with new observed state
-                    continue;
+            // Bounded spin to avoid parking if the lock becomes free quickly
+            let mut spins = 32u32;
+            while spins > 0 {
+                let s = inner.state.load(Ordering::Relaxed);
+                if (s & ONE_WRITER) == 0 {
+                    let desired = ONE_WRITER | (s & (READERS_PARKED | WRITERS_PARKED));
+                    if inner
+                        .state
+                        .compare_exchange_weak(
+                            s,
+                            desired,
+                            Ordering::Acquire,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
                 }
+                core::hint::spin_loop();
+                spins -= 1;
             }
+
+            // Ensure WRITERS_PARKED is set (no need to loop; just set the bit)
+            inner.state.fetch_or(WRITERS_PARKED, Ordering::Relaxed);
 
             // Park current thread in writers queue
             let (parker, unparker) = ThreadParker::new();
@@ -173,6 +184,7 @@ impl Mutex {
         }
     }
 
+    #[inline(always)]
     pub fn lock_group(&self) {
         if self.try_lock_shared_fast() {
             return;
@@ -195,6 +207,7 @@ impl Mutex {
         false
     }
 
+    #[cold]
     fn lock_shared_slow(&self) {
         let inner = self.inner();
         loop {
@@ -215,16 +228,8 @@ impl Mutex {
                 state = inner.state.load(Ordering::Relaxed);
             }
 
-            // Set READERS_PARKED if not set
-            let observed = inner.state.load(Ordering::Relaxed);
-            if observed & READERS_PARKED == 0 {
-                let _ = inner.state.compare_exchange_weak(
-                    observed,
-                    observed | READERS_PARKED,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-            }
+            // Set READERS_PARKED flag
+            let _ = inner.state.fetch_or(READERS_PARKED, Ordering::Relaxed);
 
             // Park current thread in readers queue
             let (parker, unparker) = ThreadParker::new();
@@ -237,6 +242,7 @@ impl Mutex {
         }
     }
 
+    #[inline(always)]
     pub fn unlock_group(&self) {
         let inner = self.inner();
         let prev = inner.state.fetch_sub(ONE_READER, Ordering::Release);
@@ -261,6 +267,7 @@ impl Mutex {
         }
     }
 
+    #[inline(always)]
     pub fn unlock_exclusive(&self) {
         let inner = self.inner();
         // Fast path: no one is waiting
@@ -274,6 +281,7 @@ impl Mutex {
         self.unlock_exclusive_slow();
     }
 
+    #[cold]
     fn unlock_exclusive_slow(&self) {
         let inner = self.inner();
         let state = inner.state.load(Ordering::Relaxed);
@@ -336,6 +344,7 @@ impl Mutex {
         self.unpark_all_readers();
     }
 
+    #[cold]
     pub(crate) fn suspend(&self, t: MutexType) -> bool {
         match t {
             MutexType::Exclusive => {
@@ -365,10 +374,12 @@ impl Mutex {
         }
     }
 
+    #[cold]
     pub(crate) fn pause(&self, timeout: Duration) {
         thread::sleep(timeout)
     }
 
+    #[inline(always)]
     pub(crate) fn wake_all(&self, t: MutexType) {
         match t {
             MutexType::Exclusive => self.unpark_one_writer(), // semantics: wake one writer (exclusive queue is FIFO-ish)
@@ -376,6 +387,7 @@ impl Mutex {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn wake(&self, t: MutexType) -> bool {
         match t {
             MutexType::Exclusive => {
@@ -389,7 +401,7 @@ impl Mutex {
         }
     }
 
-    #[inline]
+    #[cold]
     fn unpark_all_readers(&self) {
         let inner = self.inner();
         // Detach the readers queue under the small wait_mutex to avoid races with suspend
@@ -409,7 +421,7 @@ impl Mutex {
         }
     }
 
-    #[inline]
+    #[cold]
     fn unpark_one_writer(&self) {
         let inner = self.inner();
         let one;

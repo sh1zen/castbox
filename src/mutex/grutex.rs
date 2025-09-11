@@ -617,7 +617,7 @@ impl Clone for Grutex {
 
 impl Drop for Grutex {
     fn drop(&mut self) {
-        if self.inner().ref_count.fetch_sub(1, AcqRel) == 1 {
+        if self.inner().ref_count.fetch_sub(1, Release) == 1 {
             fence(Acquire);
             let ptr = self.ptr as *mut InnerGrutex;
             unsafe { drop(Box::from_raw(ptr)) };

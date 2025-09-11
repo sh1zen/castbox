@@ -5,36 +5,58 @@ use std::{hint, thread};
 const SPIN_LIMIT: u32 = 6;
 const YIELD_LIMIT: u32 = 10;
 
-/// Performs exponential backoff in spin loops.
+/// Exponential backoff helper for spin- and yield-based waiting.
 ///
-/// Backing off in spin loops reduces contention and improves overall performance.
+/// Backing off in retry loops reduces contention and can improve overall throughput,
+/// especially under medium contention.
 ///
-/// This primitive can execute *YIELD* and *PAUSE* instructions, yield the current thread to the OS
-/// scheduler, and tell when is a good time to block the thread using a different synchronization
-/// mechanism. Each step of the back off procedure takes roughly twice as long as the previous
-/// step.
+/// Backoff starts by issuing lightweight processor hints via [core::hint::spin_loop]
+/// and gradually escalates to yielding the current thread to the OS scheduler
+/// via [std::thread::yield_now]. After enough steps, it is considered "completed"
+/// and callers are advised to switch to a blocking primitive instead.
+/// Each step takes roughly twice as long as the previous one.
+///
+/// Example
+/// ```rust,ignore
+/// let backoff = Backoff::new();
+/// loop {
+///     if try_do_something() {
+///         backoff.reset();
+///         break;
+///     }
+///     backoff.snooze();
+///     if backoff.is_completed() {
+///         park_or_block();
+///     }
+/// }
+/// ```
 pub(crate) struct Backoff {
     step: Cell<u32>,
 }
-
 impl Backoff {
-    /// Creates a new `Backoff`.
+    /// Creates a new `Backoff` starting at step 0.
+    ///
+    /// This is a lightweight, non-allocating operation intended to be used per
+    /// wait/retry loop (do not share a single instance between threads).
     pub(crate) fn new() -> Self {
         Backoff { step: Cell::new(0) }
     }
 
-    /// Resets the `Backoff`.
+    /// Resets the internal step counter to `0`.
+    ///
+    /// Call this after making progress so subsequent waits start from the
+    /// shortest delay again.
     #[inline]
     pub(crate) fn reset(&self) {
         self.step.set(0);
     }
 
-    /// Backs off in a lock-free loop.
+    /// Performs one exponential backoff step suitable for lock-free retry loops.
     ///
-    /// This method should be used when we need to retry an operation because another thread made
-    /// progress.
-    ///
-    /// The processor may yield using the *YIELD* or *PAUSE* instruction.
+    /// Use this when another thread likely made progress and we want to retry soon.
+    /// This issues [core::hint::spin_loop] hints up to `SPIN_LIMIT` and advances the
+    /// internal step counter (capped for spinning). It never yields the thread to
+    /// the OS; for that, prefer [`snooze`].
     #[inline]
     pub(crate) fn spin(&self) {
         for _ in 0..1 << self.step.get().min(SPIN_LIMIT) {
@@ -46,19 +68,25 @@ impl Backoff {
         }
     }
 
+    /// Skips directly to the yielding phase of the backoff.
+    ///
+    /// Sets the internal step just past the spinning threshold so that subsequent
+    /// calls to [`snooze`] will yield the current thread to the OS. Useful when
+    /// additional short spins are unlikely to help.
+    #[inline]
     pub(crate) fn yielder(&self) {
         self.step.set(SPIN_LIMIT + 1);
     }
 
-    /// Backs off in a blocking loop.
+    /// Performs one backoff step that may yield the current thread.
     ///
-    /// This method should be used when we need to wait for another thread to make progress.
+    /// Use this in blocking/wait loops when we are waiting for another thread to make progress.
+    /// While `step <= SPIN_LIMIT`, this behaves like [`spin`] (CPU pause/hints). After that,
+    /// it yields the current thread via [std::thread::yield_now]. The step counter advances up to
+    /// `YIELD_LIMIT`.
     ///
-    /// The processor may yield using the *YIELD* or *PAUSE* instruction and the current thread
-    /// may yield by giving up a timeslice to the OS scheduler.
-    ///
-    /// If possible, use [`is_completed`] to check when it is advised to stop using backoff and
-    /// block the current thread using a different synchronization mechanism instead.
+    /// If possible, use [`is_completed`] to decide when to stop using backoff and switch to
+    /// a blocking synchronization primitive instead.
     #[inline]
     pub(crate) fn snooze(&self) {
         if self.step.get() <= SPIN_LIMIT {
@@ -74,13 +102,19 @@ impl Backoff {
         }
     }
 
-    /// Returns `true` if exponential backoff has completed and blocking the thread is advised.
+    /// Returns `true` once backoff has exceeded `YIELD_LIMIT` and blocking is advised.
+    ///
+    /// At this point, prefer parking the thread or using a different synchronization
+    /// mechanism instead of continuing to spin/yield.
     #[inline]
     pub(crate) fn is_completed(&self) -> bool {
         self.step.get() > YIELD_LIMIT
     }
 
-    /// Returns `true` if exponential backoff has completed the spinning threshold.
+    /// Returns `true` once the backoff has reached the yielding phase (`step >= SPIN_LIMIT`).
+    ///
+    /// When this is `true`, subsequent calls to [`snooze`] will yield the current
+    /// thread to the OS scheduler.
     #[inline]
     pub(crate) fn is_yielding(&self) -> bool {
         self.step.get() >= SPIN_LIMIT

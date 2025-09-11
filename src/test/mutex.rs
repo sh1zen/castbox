@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 #[cfg(test)]
 mod tests_mutex {
     use crate::mutex::Mutex;
@@ -7,7 +9,7 @@ mod tests_mutex {
     use std::time::Duration;
 
     #[test]
-    fn kiko() {
+    pub(crate) fn kiko() {
         let m = Mutex::new();
 
         m.lock_exclusive();
@@ -37,7 +39,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn stress_test() {
+    pub(crate) fn stress_test() {
         let mut handles = vec![];
 
         let mutex = Mutex::new();
@@ -64,7 +66,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn test_mutex() {
+    pub(crate) fn test_mutex() {
         use crate::mutex::Mutex;
         use std::thread;
         use std::thread::sleep;
@@ -100,7 +102,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn refcount_clone_drop() {
+    pub(crate) fn refcount_clone_drop() {
         let m = Mutex::new();
         assert_eq!(m.get_ref_count(), 1);
         let c1 = m.clone();
@@ -112,7 +114,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn is_locked_reflects_state() {
+    pub(crate) fn is_locked_reflects_state() {
         let m = Mutex::new();
         assert!(!m.is_locked_exclusive());
         {
@@ -124,7 +126,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn exclusive_blocks_others() {
+    pub(crate) fn exclusive_blocks_others() {
         let m = Mutex::new();
 
         let entered_group = Arc::new(AtomicBool::new(false));
@@ -161,7 +163,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn group_allows_concurrency() {
+    pub(crate) fn group_allows_concurrency() {
         let m = Mutex::new();
         const N: usize = 6;
 
@@ -193,7 +195,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn exclusives_are_mutually_exclusive() {
+    pub(crate) fn exclusives_are_mutually_exclusive() {
         let m = Mutex::new();
         let inside = Arc::new(AtomicBool::new(false));
         let ok = Arc::new(AtomicBool::new(true));
@@ -224,7 +226,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn group_batch_then_exclusive() {
+    pub(crate) fn group_batch_then_exclusive() {
         let m = Mutex::new();
         const G: usize = 4;
         let barrier_in = Arc::new(Barrier::new(G));
@@ -262,7 +264,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn unlock_panics_if_group_locked() {
+    pub(crate) fn unlock_panics_if_group_locked() {
         let m = Mutex::new();
         m.lock_group();
         let res = std::panic::catch_unwind(|| {
@@ -273,7 +275,7 @@ mod tests_mutex {
     }
 
     #[test]
-    fn stress_multi_lock() {
+    pub(crate) fn stress_multi_lock() {
         let m = Mutex::new();
 
         let mut ths = Vec::new();
@@ -295,4 +297,24 @@ mod tests_mutex {
             t.join().unwrap();
         }
     }
+}
+
+#[test]
+fn run_all_tests1() {
+    let start = Instant::now();
+
+    tests_mutex::kiko();
+    tests_mutex::stress_test();
+    // tests_mutex::test_mutex();
+    tests_mutex::refcount_clone_drop();
+    tests_mutex::is_locked_reflects_state();
+    tests_mutex::exclusive_blocks_others();
+    tests_mutex::group_allows_concurrency();
+    tests_mutex::exclusives_are_mutually_exclusive();
+    tests_mutex::group_batch_then_exclusive();
+    tests_mutex::unlock_panics_if_group_locked();
+    tests_mutex::stress_multi_lock();
+
+    let elapsed = start.elapsed();
+    println!("Tempo totale esecuzione test: {:?}", elapsed);
 }
