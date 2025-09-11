@@ -17,7 +17,7 @@
 pub mod containers;
 
 pub mod channels;
-pub mod collections;
+pub mod atomic;
 pub mod mutex;
 pub mod utils;
 

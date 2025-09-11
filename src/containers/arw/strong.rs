@@ -112,7 +112,7 @@ impl<T> Arw<T> {
     /// ```
     pub fn as_ref(&self) -> WatchGuardRef<'_, T> {
         let lock = self.inner().lock.clone();
-        lock.lock_group();
+        lock.lock_shared();
 
         WatchGuardRef::new(self.inner().get_ref(), lock)
     }

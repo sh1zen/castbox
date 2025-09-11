@@ -168,7 +168,7 @@ impl<T> PtrInterface<T> for WeakArw<T> {
 
     #[inline]
     unsafe fn from_inner_in(ptr: *mut ArwInner<T>) -> Self {
-        debug_assert!(!ptr.is_null());
+        assert!(!ptr.is_null());
         Self { ptr }
     }
 }

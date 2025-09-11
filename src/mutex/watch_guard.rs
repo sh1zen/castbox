@@ -53,7 +53,7 @@ impl<T> DerefMut for WatchGuard<T> {
 impl<T> Drop for WatchGuard<T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.unlock_group();
+        self.lock.unlock_shared();
     }
 }
 

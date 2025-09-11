@@ -1,26 +1,27 @@
 
-# 📦 Rust Concurrent Primitives: Runtime-Typed Smart Pointers & Lock-Free Data Structures.
+# 📦 Blazingly fast concurrent Data Structures.
 
 
-- 🔐 Thread-safe with spin-lock with backoff on kernel-level mutexes
+- 🪪 Thread-safe with spin-lock backoff and kernel-level mutexes
 - ⚡ Optimized for high-concurrency workloads
-- 💾 Safe memory management via reference counting and internal cloning
+- 💾 Safe memory management via reference counting to optimize cloning
+- 🔐 Internal mutability, just use &self
 
 ---
 
-## ✨ AtomicVec — Lock-Free Atomic Vector
+## ✨ AtomicVec
 
 **AtomicVec** is a lock-free, thread-safe vector in Rust designed for high-concurrency environments. It supports atomic push and pop operations with minimal blocking, maintaining safe memory management through ManuallyDrop and reference counting.
 
 - 🧠 Suitable for implementing queues, stacks, and other dynamic collections
 
-## ✨ AtomicHashMap — Lock-Free Concurrent Hash Map 
+## ✨ AtomicHashMap 
 
 **AtomicHashMap** is a thread-safe, concurrent hash map in Rust that supports high-performance insertion, retrieval, and removal of key-value pairs. It uses fine-grained atomic operations combined with internal mutexes to manage contention efficiently.
 
-- 🧠 Ideal for shared caches, state maps, and runtime-managed data
+- 🧠 Ideal for Shared caches, state maps, and runtime-managed data
 
-## ✨ AtomicChain — Lock-Free Concurrent Multi value Hash Map 
+## ✨ AtomicChain — Multi value Hash Map 
 
 **AtomicChain** is a high-performance, thread-safe key-value store implemented in Rust. It is designed for concurrent access without blocking, using fine-grained atomic operations and internal mutexes to manage contention.
 
@@ -31,7 +32,7 @@
 
 **Arw** is an atomic smart pointer with fine-grained internal locking and strong/weak reference counting. It provides safe data sharing across threads, controlled concurrent access, and raw pointer conversions without relying on kernel-level mutexes.
 
-- 🧠 Suitable for shared data structures, caches, and custom concurrent primitives
+- 🧠 Suitable for Shared data structures, caches, and custom concurrent primitives
 
 ## ✨ AnyRef — Runtime-Typed Reference-Counted Smart Pointer 
 
@@ -40,7 +41,7 @@ It is ideal for scenarios where type erasure and runtime polymorphism are needed
 
 - 🧠 Safe runtime downcasting (`try_downcast`, `try_downcast_mut`)
 
-## ✨ Mutex — User-Space Fast Mutex 
+## ✨ Mutex — Fast raw locking 
 
 **Mutex** is a high-performance user-space mutex supporting exclusive and group locks. Built on atomic primitives and exponential backoff, it minimizes kernel-level contention while providing safe multi-threaded access control.
 
