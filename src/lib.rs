@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![allow(dead_code)]
+#![allow(unsafe_op_in_unsafe_fn)]
 #![doc(test(
     no_crate_inject,
     attr(
@@ -11,13 +12,13 @@
     rust_2024_compatibility,
     rust_2018_idioms,
     rustdoc::broken_intra_doc_links,
-    unreachable_pub
+    unreachable_pub,
 )]
 
 pub mod containers;
 
+pub mod atomic;
 pub mod channels;
-pub mod collections;
 pub mod mutex;
 pub mod utils;
 

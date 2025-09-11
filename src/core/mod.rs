@@ -1,8 +1,8 @@
-mod splcell;
 pub(crate) mod backoff;
 pub mod futex;
-pub(crate) mod thread;
-pub(crate) mod smutex;
 pub(crate) mod scondvar;
+pub(crate) mod smutex;
+mod splcell;
+pub(crate) mod thread;
 
-pub use splcell::{SpinLockCell, SpinLockGuard};
+pub use splcell::{SpinLockCell, ExclusiveGuard, SharedGuard};

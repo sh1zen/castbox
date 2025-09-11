@@ -1,6 +1,6 @@
 [package]
 name = "castbox"
-version = "0.0.12"
+version = "0.0.13"
 authors = ["sh1zen dev.sh1zen@outlook.it"]
 edition = "2024"
 description = "A Runtime-Typed Reference-Counted Smart Pointer and Concurrent Programming tools."
@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/sh1zen/castbox"
 documentation = "https://docs.rs/castbox"
 readme = "README.md"
-keywords = ["lock-free", "dyn-any", "thread-safe", "reference-counted", "atomic"]
+keywords = ["lock-free", "atomic", "thread-safe", "reference-counted", "dyn-any"]
 categories = ["data-structures", "concurrency", "memory-management", "development-tools"]
 exclude = [".gitignore", ".github/*"]
 homepage = "https://github.com/sh1zen/castbox"
@@ -17,8 +17,20 @@ homepage = "https://github.com/sh1zen/castbox"
 name = "castbox"
 path = "src/lib.rs"
 
+[dependencies]
+crossbeam-utils = "0.8.21"
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "all"
+path = "benches/bench.rs"
+harness = false
+
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
-libc = "0.2.175"
+libc = "0.2.176"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.0", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_System_WindowsProgramming"] }
+windows-sys = { version = "0.61.1", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_System_WindowsProgramming"] }
+

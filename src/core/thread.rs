@@ -1,4 +1,5 @@
 use crate::core::futex::{futex_wait, futex_wake};
+use crossbeam_utils::CachePadded;
 use std::sync::atomic;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, Thread};
@@ -8,39 +9,33 @@ type State = usize;
 const PARKED: State = 0;
 const UNPARKED: State = 1;
 
-/// Parker inner state; shared via Arc to avoid use-after-free.
 struct ThreadInner {
-    /// Number of available tokens (permits). Do not use negative values as persistent state.
-    tokens: AtomicUsize,
-    /// n.ro of current clones
-    ref_count: AtomicUsize,
-    /// Handle of the thread associated with this parker.
+    tokens: CachePadded<AtomicUsize>,
+    ref_count: CachePadded<AtomicUsize>,
     thread: Thread,
 }
 
 impl ThreadInner {
     fn new() -> Self {
         Self {
-            tokens: AtomicUsize::new(UNPARKED),
-            ref_count: AtomicUsize::new(1),
+            tokens: CachePadded::new(AtomicUsize::new(UNPARKED)),
+            ref_count: CachePadded::new(AtomicUsize::new(1)),
             thread: thread::current(),
         }
     }
 
-    /// Atomic attempt to consume a token; returns true on success.
-    /// Implemented with compare_exchange to avoid taking the counter negative
-    /// under concurrency.
+    #[inline]
     fn try_consume_token(&self) -> bool {
         self.tokens
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+            .fetch_update(Ordering::Acquire, Ordering::Acquire, |v| {
                 if v > PARKED { Some(v - 1) } else { None }
             })
-            .unwrap_or(PARKED)
-            >= UNPARKED
+            .is_ok()
     }
 
-    /// Increment tokens (unpark).
+    #[inline]
     fn add_token(&self) -> usize {
+        // CORRECT: Release to publish the token
         self.tokens.fetch_add(1, Ordering::Release)
     }
 }
@@ -66,45 +61,40 @@ impl ThreadParker {
         unsafe { &*self.ptr }
     }
 
-    /// Park: consume a token if available, otherwise wait for a notification.
-    /// The loop handles spurious wakeups and persistent notifications.
     pub(crate) fn park(&self) {
         let inner = self.inner();
 
-        // if we can consume a token immediately, return.
+        // Fast path
         if inner.try_consume_token() {
             return;
         }
 
+        // Slow path
         loop {
-            // Before parking, check the persistent notification:
+            // Try again to consume before blocking
             if inner.try_consume_token() {
                 return;
-            } else {
-                loop {
-                    // Wait for something to happen, assuming it's still set to PARKED.
-                    futex_wait(&inner.tokens, PARKED);
-                    // Change NOTIFIED=>EMPTY and return in that case.
-                    if inner.tokens.load(Ordering::Acquire) > PARKED {
-                        return;
-                    } else {
-                        // Spurious wake up. We loop to try again.
-                    }
-                }
             }
+
+            // CRITICAL: futex_wait checks atomically
+            // If tokens != PARKED when called, it returns immediately
+            futex_wait(&inner.tokens, PARKED);
+
+            // After wake (or spurious wakeup), recheck
+            // Do not assume a token is available
         }
     }
 
-    /// Unpark: add a token and notify the parker. Never blocks.
     pub(crate) fn unpark(&self) {
         let inner = self.inner();
-        // Add token (publish)
+
+        // Always increment and always wake
+        // This avoids the race where the wake could be lost
         inner.add_token();
 
-        // Note that even NOTIFIED=>NOTIFIED results in a write. This is on
-        // purpose, to make sure every unpark() has a release-acquire ordering
-        // with park().
-        futex_wake(&inner.tokens);
+        // Wake up ALL threads (safer to prevent deadlocks)
+        // or at least one if you are sure about the logic
+        futex_wake(&*inner.tokens);
     }
 }
 
@@ -117,7 +107,7 @@ impl Clone for ThreadParker {
 
 impl Drop for ThreadParker {
     fn drop(&mut self) {
-        if self.inner().ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
 
             let ptr = self.ptr as *mut ThreadInner;
@@ -172,7 +162,8 @@ impl Clone for Unparker {
 
 #[cfg(test)]
 mod tests_thread {
-    use super::*;
+    use crate::core::thread::ThreadParker;
+    use std::thread;
     use std::time::Duration;
 
     #[test]

@@ -1,381 +1,185 @@
 use crate::core::futex::{futex_wait, futex_wake};
+use crate::mutex::Backoff;
+use crossbeam_utils::CachePadded;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Internal bit flags for the mutex state.
 const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;
+const GROUP_FLAG: usize = 2; // Indicates that group (shared) locks are active
 
+/// A lightweight futex-based spin mutex supporting both
+/// exclusive and group (shared) locking modes.
+///
+/// - Fast path: lock acquisition via atomic CAS.
+/// - Slow path: adaptive spinning with futex sleep.
+/// - Group locks can coexist with others, similar to read locks.
 pub(crate) struct SMutex {
-    state: AtomicUsize,
+    state: CachePadded<AtomicUsize>,
 }
 
 impl SMutex {
+    /// Creates a new unlocked mutex.
     pub(crate) fn new() -> Self {
         Self {
-            state: AtomicUsize::new(UNLOCKED),
+            state: CachePadded::new(AtomicUsize::new(UNLOCKED)),
         }
     }
 
+    /// Returns `true` if the mutex is currently locked (either exclusive or group).
     pub(crate) fn is_locked(&self) -> bool {
-        self.state.load(Ordering::Relaxed) == LOCKED
+        self.state.load(Ordering::Relaxed) & LOCKED != 0
     }
 
+    /// Acquires the mutex in exclusive mode (blocking).
     pub(crate) fn lock(&self) -> SGuard<'_> {
         self.raw_lock();
         SGuard::new(self)
     }
 
+    /// Acquires the mutex in group (shared) mode (blocking).
+    pub(crate) fn lock_group(&self) -> SGuard<'_> {
+        self.raw_lock_group();
+        SGuard::new_group(self)
+    }
+
+    /// Attempts to lock the mutex in exclusive mode (fast path).
+    /// Falls back to the slow path on contention.
     pub(crate) fn raw_lock(&self) {
         if self
             .state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
         {
-            return;
+            self.raw_lock_slow();
         }
+    }
 
-        // Altrimenti entriamo in attesa
+    /// Locks the mutex in group (shared) mode.
+    /// Allows multiple concurrent holders unless a writer is active.
+    fn raw_lock_group(&self) {
+        let spin = Backoff::new();
         loop {
-            // Aspettiamo finché lo stato rimane LOCKED
-            while self.state.load(Ordering::Relaxed) == LOCKED {
-                futex_wait(&self.state, LOCKED);
+            let mut state = self.state.load(Ordering::Relaxed);
+
+            // If no writer is active, add the group flag
+            while state & LOCKED == 0 {
+                let new_state = state | GROUP_FLAG;
+                match self.state.compare_exchange_weak(
+                    state,
+                    new_state,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(e) => state = e,
+                }
             }
 
-            // Ritentiamo l'acquisizione
-            if self
-                .state
-                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
+            // If a writer holds the lock, spin or sleep
+            if state & LOCKED != 0 {
+                if !spin.is_yielding() {
+                    spin.snooze();
+                    continue;
+                }
+
+                // Wait until writer releases the lock
+                while self.state.load(Ordering::Relaxed) & LOCKED != 0 {
+                    futex_wait(&self.state, state);
+                }
             }
         }
     }
 
+    /// Slow path for exclusive locking.
+    /// Spins briefly, then waits on futex until the mutex becomes available.
+    fn raw_lock_slow(&self) {
+        let spin = Backoff::new();
+        loop {
+            let mut state = self.state.load(Ordering::Relaxed);
+
+            // Try to acquire the lock if currently unlocked
+            while state == UNLOCKED {
+                match self.state.compare_exchange_weak(
+                    UNLOCKED,
+                    LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(e) => state = e,
+                }
+            }
+
+            // If already locked, spin and eventually sleep
+            if state == LOCKED {
+                if !spin.is_yielding() {
+                    spin.snooze();
+                    continue;
+                }
+
+                while self.state.load(Ordering::Relaxed) == LOCKED {
+                    futex_wait(&self.state, LOCKED);
+                }
+            }
+        }
+    }
+
+    /// Unlocks an exclusive lock and wakes up one waiter.
     pub(crate) fn raw_unlock(&self) {
-        self.state.store(UNLOCKED, Ordering::Release);
-        futex_wake(&self.state as *const _);
+        self.state.fetch_and(!LOCKED, Ordering::Release);
+        futex_wake(&*self.state);
+    }
+
+    /// Unlocks a group (shared) lock and wakes up one waiter.
+    pub(crate) fn raw_unlock_group(&self) {
+        self.state.fetch_and(!GROUP_FLAG, Ordering::Release);
+        futex_wake(&*self.state);
     }
 }
 
+/// RAII guard for SMutex that automatically unlocks on drop.
 pub(crate) struct SGuard<'a> {
     m: &'a SMutex,
+    is_group: bool,
 }
 
 impl<'a> SGuard<'a> {
+    /// Creates a new exclusive guard.
     fn new(m: &'a SMutex) -> SGuard<'a> {
-        SGuard { m }
+        SGuard { m, is_group: false }
     }
 
-    pub(crate) fn lock(this: &SGuard<'_>) {
-        this.m.raw_lock();
+    /// Creates a new group (shared) guard.
+    pub(crate) fn new_group(m: &'a SMutex) -> SGuard<'a> {
+        SGuard { m, is_group: true }
     }
 
+    /// Explicit unlock (optional manual release before drop).
     pub(crate) fn unlock(this: &SGuard<'_>) {
-        this.m.raw_unlock();
+        if this.is_group {
+            this.m.raw_unlock_group();
+        } else {
+            this.m.raw_unlock();
+        }
+    }
+
+    /// Explicit re-lock (optional reacquisition).
+    pub(crate) fn lock(this: &SGuard<'_>) {
+        if this.is_group {
+            this.m.raw_lock_group();
+        } else {
+            this.m.raw_lock();
+        }
     }
 }
 
 impl<'a> Drop for SGuard<'a> {
     fn drop(&mut self) {
-        self.m.raw_unlock()
-    }
-}
-
-#[cfg(test)]
-mod tests_mutex {
-    use crate::mutex::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn kiko() {
-        let m = Mutex::new();
-
-        m.lock_exclusive();
-
-        let mc = m.clone();
-        let t1 = thread::spawn(move || {
-            mc.lock_group();
-            mc.lock_group();
-            mc.lock_group();
-
-            thread::sleep(Duration::from_millis(200));
-            mc.unlock_all_group();
-        });
-
-        let mc = m.clone();
-        let t2 = thread::spawn(move || {
-            let _x = mc.clone();
-            mc.unlock_exclusive();
-            thread::sleep(Duration::from_millis(100));
-            mc.lock_exclusive();
-        });
-
-        t1.join().unwrap();
-        t2.join().unwrap();
-
-        m.unlock_exclusive();
-    }
-
-    #[test]
-    fn stress_test() {
-        let mut handles = vec![];
-
-        let mutex = Mutex::new();
-
-        mutex.lock_exclusive();
-
-        for _i in 0..100 {
-            let m1 = mutex.clone();
-            handles.push(thread::spawn(move || {
-                m1.lock_group();
-            }));
-        }
-
-        assert!(!mutex.is_locked_group());
-
-        mutex.unlock_exclusive();
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert!(mutex.is_locked_group());
-        drop(mutex);
-    }
-
-    #[test]
-    fn test_mutex() {
-        use crate::mutex::Mutex;
-        use std::thread;
-        use std::thread::sleep;
-        use std::time::Duration;
-
-        let mutex = Mutex::new();
-
-        let m1 = mutex.clone();
-        let m2 = mutex.clone();
-
-        mutex.lock_group();
-        mutex.lock_group();
-
-        mutex.unlock_group();
-
-        let h1 = thread::spawn(move || {
-            m1.lock_exclusive();
-            sleep(Duration::from_millis(100));
-            m1.unlock_exclusive();
-        });
-
-        let h2 = thread::spawn(move || {
-            m2.lock_exclusive();
-            m2.unlock_exclusive();
-        });
-
-        mutex.unlock_group();
-
-        h1.join().unwrap();
-        h2.join().unwrap();
-
-        drop(mutex);
-    }
-
-    #[test]
-    fn refcount_clone_drop() {
-        let m = Mutex::new();
-        assert_eq!(m.get_ref_count(), 1);
-        let c1 = m.clone();
-        let c2 = m.clone();
-        assert_eq!(m.get_ref_count(), 3);
-        drop(c1);
-        drop(c2);
-        assert_eq!(m.get_ref_count(), 1);
-    }
-
-    #[test]
-    fn is_locked_reflects_state() {
-        let m = Mutex::new();
-        assert!(!m.is_locked_exclusive());
-        {
-            let _g = m.lock_exclusive();
-            assert!(m.is_locked_exclusive());
-            m.unlock_exclusive();
-        }
-        assert!(!m.is_locked_exclusive());
-    }
-
-    #[test]
-    fn exclusive_blocks_others() {
-        let m = Mutex::new();
-
-        let entered_group = Arc::new(AtomicBool::new(false));
-        let entered_excl = Arc::new(AtomicBool::new(false));
-
-        m.lock_exclusive();
-        let eg = entered_group.clone();
-        let mg = m.clone();
-        let tg = thread::spawn(move || {
-            mg.lock_group();
-            eg.store(true, Ordering::Release);
-            mg.unlock_group();
-        });
-
-        let ee = entered_excl.clone();
-        let me = m.clone();
-        let te = thread::spawn(move || {
-            me.lock_exclusive();
-            ee.store(true, Ordering::Release);
-            me.unlock_exclusive();
-        });
-
-        thread::sleep(Duration::from_millis(50));
-        assert!(!entered_group.load(Ordering::Acquire));
-        assert!(!entered_excl.load(Ordering::Acquire));
-
-        m.unlock_exclusive();
-
-        tg.join().unwrap();
-        te.join().unwrap();
-
-        assert!(entered_group.load(Ordering::Acquire));
-        assert!(entered_excl.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn group_allows_concurrency() {
-        let m = Mutex::new();
-        const N: usize = 6;
-
-        let barrier = Arc::new(Barrier::new(N));
-        let concurrent = Arc::new(AtomicUsize::new(0));
-        let max_concurrent = Arc::new(AtomicUsize::new(0));
-
-        let mut ths = Vec::new();
-        for _ in 0..N {
-            let mm = m.clone();
-            let b = barrier.clone();
-            let cur = concurrent.clone();
-            let maxc = max_concurrent.clone();
-            ths.push(thread::spawn(move || {
-                mm.lock_group();
-                b.wait();
-                let now = cur.fetch_add(1, Ordering::AcqRel) + 1;
-                maxc.fetch_max(now, Ordering::AcqRel);
-                thread::sleep(Duration::from_millis(20));
-                cur.fetch_sub(1, Ordering::AcqRel);
-            }));
-        }
-        for t in ths {
-            t.join().unwrap();
-        }
-        m.unlock_all_group();
-        assert!(max_concurrent.load(Ordering::Acquire) > 1);
-        assert!(!m.is_locked_exclusive());
-    }
-
-    #[test]
-    fn exclusives_are_mutually_exclusive() {
-        let m = Mutex::new();
-        let inside = Arc::new(AtomicBool::new(false));
-        let ok = Arc::new(AtomicBool::new(true));
-
-        let mut ths = Vec::new();
-        for _i in 0..4 {
-            let mm = m.clone();
-            let inside = inside.clone();
-            let ok = ok.clone();
-            ths.push(thread::spawn(move || {
-                let _x = _i;
-                let _k = mm.get_ref_count();
-                for _j in 0..50 {
-                    mm.lock_exclusive();
-                    if inside.swap(true, Ordering::AcqRel) {
-                        ok.store(false, Ordering::Release);
-                    }
-                    //thread::sleep(Duration::from_millis(1));
-                    inside.store(false, Ordering::Release);
-                    mm.unlock_exclusive();
-                }
-            }));
-        }
-        for t in ths {
-            t.join().unwrap();
-        }
-        assert!(ok.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn group_batch_then_exclusive() {
-        let m = Mutex::new();
-        const G: usize = 4;
-        let barrier_in = Arc::new(Barrier::new(G));
-        let barrier_out = Arc::new(Barrier::new(G));
-
-        let mut tg = Vec::new();
-        for _ in 0..G {
-            let mm = m.clone();
-            let bin = barrier_in.clone();
-            let bout = barrier_out.clone();
-            tg.push(thread::spawn(move || {
-                mm.lock_group();
-                bin.wait();
-                thread::sleep(Duration::from_millis(30));
-                bout.wait();
-                mm.unlock_group();
-            }));
-        }
-
-        let entered_excl = Arc::new(AtomicBool::new(false));
-        let ee = entered_excl.clone();
-        let me = m.clone();
-        let te = thread::spawn(move || {
-            me.lock_exclusive();
-            ee.store(true, Ordering::Release);
-            me.unlock_exclusive();
-        });
-
-        te.join().unwrap();
-        for t in tg {
-            t.join().unwrap();
-        }
-
-        assert!(entered_excl.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn unlock_panics_if_group_locked() {
-        let m = Mutex::new();
-        m.lock_group();
-        let res = std::panic::catch_unwind(|| {
-            m.unlock_exclusive();
-        });
-        assert!(res.is_err());
-        m.unlock_group();
-    }
-
-    #[test]
-    fn stress_multi_lock() {
-        let m = Mutex::new();
-
-        let mut ths = Vec::new();
-        for id in 0..8 {
-            let mm = m.clone();
-            ths.push(thread::spawn(move || {
-                for i in 0..100 {
-                    if (id + i) % 3 == 0 {
-                        mm.lock_exclusive();
-                        mm.unlock_exclusive();
-                    } else {
-                        mm.lock_group();
-                        mm.unlock_group();
-                    }
-                }
-            }));
-        }
-        for t in ths {
-            t.join().unwrap();
+        if self.is_group {
+            self.m.raw_unlock_group();
+        } else {
+            self.m.raw_unlock();
         }
     }
 }

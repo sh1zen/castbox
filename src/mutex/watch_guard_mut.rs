@@ -2,21 +2,22 @@ use crate::mutex::Mutex;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
+use crossbeam_utils::CachePadded;
 
 /// used as wrapper for a pointer to a reference
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardMut<'a, T: ?Sized> {
-    data: &'a mut T,
-    lock: Mutex,
+    data: *mut T,
+    lock: CachePadded<Mutex>,
     marker: PhantomData<&'a mut T>,
 }
 
 impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     ///create a new WatchGuard from a &mut T and AnyRef
-    pub fn new(ptr: &'mutex mut T, lock: Mutex) -> WatchGuardMut<'mutex, T> {
+    pub fn new(ptr: *mut T, lock: Mutex) -> WatchGuardMut<'mutex, T> {
         Self {
             data: ptr,
-            lock,
+            lock: CachePadded::new(lock),
             marker: PhantomData,
         }
     }
@@ -34,14 +35,14 @@ impl<T: ?Sized> Deref for WatchGuardMut<'_, T> {
 
     fn deref(&self) -> &T {
         debug_assert!(self.lock.is_locked_exclusive(), "{:?}", self.lock);
-        &*self.data
+        unsafe { &*self.data }
     }
 }
 
 impl<T: ?Sized> DerefMut for WatchGuardMut<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         debug_assert!(self.lock.is_locked_exclusive(), "{:?}", self.lock);
-        &mut *self.data
+        unsafe { &mut *self.data }
     }
 }
 
@@ -57,14 +58,14 @@ where
     T: PartialEq<U> + ?Sized,
 {
     fn eq(&self, other: &U) -> bool {
-        self.data == other
+        unsafe { &*self.data == other }
     }
 }
 
 impl<'a, T: Debug> Debug for WatchGuardMut<'a, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WatchGuardRef")
-            .field("data", self.data)
+            .field("data", &self.data)
             .field("lock", &self.lock)
             .finish()
     }
