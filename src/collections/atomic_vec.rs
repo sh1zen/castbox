@@ -172,17 +172,43 @@ impl<T> AtomicVec<T> {
 }
 
 impl<T> AtomicVec<T> {
-    pub fn to_vec(&self) -> Vec<T> {
+    /// Drain all elements from the queue in O(1) critical section and return an iterator
+    /// over owned elements. The internal lock is only held to detach the list; iteration
+    /// happens without holding the lock.
+    pub fn drain(&self) -> Option<Drain<T>> {
+        // Acquire exclusive access to detach the list
         self.lock();
 
-        let mut vec = Vec::with_capacity(self.len());
-
-        while let Some(e) = self.pop() {
-            vec.push(e);
+        // If there is a pending t_tail (queued while busy), attach it to the real tail so
+        // that it becomes visible before we detach the list. This also adjusts len.
+        let pending = self.inner().t_tail.swap(null_mut(), Ordering::Acquire);
+        if !pending.is_null() {
+            self.update_tail(pending);
         }
+
+        // Detach the whole list atomically
+        let head = self.inner().head.swap(null_mut(), Ordering::Acquire);
+        self.inner().tail.store(null_mut(), Ordering::Release);
+        // Reset length to 0 (we are taking ownership of all nodes)
+        self.inner().len.store(0, Ordering::Relaxed);
+
+        // Release the internal lock
         self.release();
 
-        vec
+        if head.is_null() {
+            None
+        } else {
+            Some(Drain { current: head })
+        }
+    }
+
+    /// NOTE: The previous to_vec implementation attempted to call pop() while holding the
+    /// internal lock, which could deadlock. Prefer using `drain()` and collecting.
+    pub fn to_vec(&self) -> Vec<T> {
+        match self.drain() {
+            Some(iter) => iter.collect(),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -293,6 +319,43 @@ impl<T> Iterator for IntoIter<T> {
 }
 
 impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        unsafe {
+            while !self.current.is_null() {
+                let node = self.current;
+                let next = (*node).next.load(Ordering::Acquire);
+                ManuallyDrop::drop(&mut (*node).value);
+                drop(Box::from_raw(node));
+                self.current = next;
+            }
+        }
+    }
+}
+
+/// Iterator returned by AtomicVec::drain(); owns a detached list
+pub struct Drain<T> {
+    current: *mut Item<T>,
+}
+
+impl<T> Iterator for Drain<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current.is_null() {
+            return None;
+        }
+        unsafe {
+            let node = self.current;
+            let next = (*node).next.load(Ordering::Acquire);
+            self.current = next;
+            let val = ManuallyDrop::into_inner(ptr::read(&(*node).value));
+            drop(Box::from_raw(node));
+            Some(val)
+        }
+    }
+}
+
+impl<T> Drop for Drain<T> {
     fn drop(&mut self) {
         unsafe {
             while !self.current.is_null() {

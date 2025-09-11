@@ -1,16 +1,14 @@
 use crate::collections::AtomicVec;
-use crate::mutex::{Mutex, MutexType};
-use std::sync::atomic;
+use crate::core::scondvar::SCondVar;
+use crate::core::smutex::SMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct MpmcInner<T> {
     buffer: AtomicVec<T>,
-    notify: Mutex,
-    /// cloned ref
+    mutex: SMutex,
+    condvar: SCondVar,
     ref_count: AtomicUsize,
-
     bounded: usize,
-
     closed: AtomicBool,
 }
 
@@ -26,14 +24,15 @@ impl<T> Mpmc<T> {
     pub fn new() -> Mpmc<T> {
         let ptr = Box::into_raw(Box::new(MpmcInner {
             buffer: AtomicVec::new(),
-            notify: Mutex::new(),
+            mutex: SMutex::new(),
+            condvar: SCondVar::new(),
             ref_count: AtomicUsize::new(1),
             bounded: 0,
             closed: AtomicBool::new(false),
         }));
 
         if ptr.is_null() {
-            panic!("Happened an invalid allocation for Mpmc");
+            panic!("Invalid allocation for Mpmc");
         }
 
         Self { ptr }
@@ -57,8 +56,7 @@ impl<T> Mpmc<T> {
         unsafe { &mut *ptr }
     }
 
-    /// non-blocking send, if closed channel or
-    /// bounded limit overcome an error is returned
+    /// non-blocking send
     pub fn send(&self, value: T) -> Result<(), T> {
         let inner = self.inner();
 
@@ -66,44 +64,50 @@ impl<T> Mpmc<T> {
             return Err(value);
         }
 
+        // controlla il limite
         if inner.bounded > 0 && inner.buffer.len() >= inner.bounded {
             return Err(value);
         }
 
+        let _guard = inner.mutex.lock();
         inner.buffer.push(value);
 
-        let _ = inner.notify.wake(MutexType::Group);
-
+        inner.condvar.notify_one();
         Ok(())
     }
 
-    /// non-blocking receiver
+    /// non-blocking receive
     pub fn try_recv(&self) -> Option<T> {
-        self.inner().buffer.pop()
+        let inner = self.inner();
+        let _guard = inner.mutex.lock();
+        inner.buffer.pop()
     }
 
-    /// blocking receiver until a data is found or channel closed
+    /// blocking receive
     pub fn recv(&self) -> Option<T> {
+        let inner = self.inner();
+
         loop {
-            if let Some(msg) = self.inner().buffer.pop() {
+            let guard = inner.mutex.lock();
+
+            if let Some(msg) = inner.buffer.pop() {
                 return Some(msg);
             }
 
-            if self.inner().closed.load(Ordering::Acquire) {
+            if inner.closed.load(Ordering::Acquire) {
                 return None;
             }
 
-            if !self.inner().notify.suspend(MutexType::Group) {
-                std::hint::spin_loop();
-            }
+            let _ = inner.condvar.wait(guard);
         }
     }
 
-    /// Chiude il canale: nuovi send falliranno; sveglia tutti i consumer parcheggiati.
+    /// Chiude il canale
     pub fn close(&self) {
-        self.inner().closed.store(true, Ordering::Release);
-        // wake all consumers to be able to terminate
-        self.inner().notify.wake_all(MutexType::Group);
+        let inner = self.inner();
+        let _guard = inner.mutex.lock();
+        inner.closed.store(true, Ordering::Release);
+        inner.condvar.notify_all();
     }
 }
 
@@ -117,10 +121,8 @@ impl<T> Clone for Mpmc<T> {
 impl<T> Drop for Mpmc<T> {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            atomic::fence(Ordering::Acquire);
-
+            std::sync::atomic::fence(Ordering::Acquire);
             let ptr = self.ptr as *mut MpmcInner<T>;
-
             unsafe { drop(Box::from_raw(ptr)) };
         }
     }

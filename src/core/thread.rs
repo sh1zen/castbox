@@ -1,4 +1,5 @@
 use crate::core::futex::{futex_wait, futex_wake};
+use std::hint::spin_loop;
 use std::sync::atomic;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, Thread};
@@ -71,40 +72,46 @@ impl ThreadParker {
     pub(crate) fn park(&self) {
         let inner = self.inner();
 
-        // if we can consume a token immediately, return.
+        // Fast path: if we can consume a token immediately, return.
         if inner.try_consume_token() {
             return;
         }
 
-        loop {
-            // Before parking, check the persistent notification:
+        // Brief spin to catch a concurrent unpark without going to sleep.
+        for _ in 0..64 {
             if inner.try_consume_token() {
                 return;
-            } else {
-                loop {
-                    // Wait for something to happen, assuming it's still set to PARKED.
-                    futex_wait(&inner.tokens, PARKED);
-                    // Change NOTIFIED=>EMPTY and return in that case.
-                    if inner.tokens.load(Ordering::Acquire) > PARKED {
-                        return;
-                    } else {
-                        // Spurious wake up. We loop to try again.
-                    }
-                }
             }
+            spin_loop();
+        }
+
+        // Sleep path: double-check before and after sleeping to avoid races
+        loop {
+            // Re-check before sleeping to avoid missed wakeups.
+            if inner.try_consume_token() {
+                return;
+            }
+
+            // Wait until the value is still PARKED. If it changes, wait returns immediately.
+            futex_wait(&inner.tokens, PARKED);
+
+            // After waking (or spuriously), attempt to consume a token.
+            if inner.try_consume_token() {
+                return;
+            }
+            // Otherwise, we observed a spurious wake or lost the race; continue waiting.
         }
     }
 
     /// Unpark: add a token and notify the parker. Never blocks.
     pub(crate) fn unpark(&self) {
         let inner = self.inner();
-        // Add token (publish)
-        inner.add_token();
-
-        // Note that even NOTIFIED=>NOTIFIED results in a write. This is on
-        // purpose, to make sure every unpark() has a release-acquire ordering
-        // with park().
-        futex_wake(&inner.tokens);
+        // Add token (publish) and wake only if there were no available tokens.
+        let prev = inner.add_token();
+        if prev == PARKED {
+            // Ensure release-acquire ordering with park().
+            futex_wake(&inner.tokens);
+        }
     }
 }
 
@@ -117,7 +124,7 @@ impl Clone for ThreadParker {
 
 impl Drop for ThreadParker {
     fn drop(&mut self) {
-        if self.inner().ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
 
             let ptr = self.ptr as *mut ThreadInner;

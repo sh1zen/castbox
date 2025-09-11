@@ -100,7 +100,7 @@ impl Clone for Barrier {
 
 impl Drop for Barrier {
     fn drop(&mut self) {
-        if self.inner().ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
             let ptr = self.ptr as *mut BarrierInner;
             unsafe { drop(Box::from_raw(ptr)) };
@@ -112,8 +112,8 @@ impl Drop for Barrier {
 mod tests_barrier {
     use super::Barrier;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::thread;
     use std::time::Duration;
