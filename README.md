@@ -143,11 +143,11 @@ let mutex = Mutex::new();
 let m1 = mutex.clone();
 let m2 = mutex.clone();
 
-mutex.lock_group();
-mutex.lock_group();
+mutex.lock_group(0);
+mutex.lock_group(0);
 
-mutex.unlock_group();
-mutex.unlock_group();
+mutex.unlock_group(0);
+mutex.unlock_group(0);
 
 let h1 = thread::spawn(move || {
     m1.lock_exclusive();
