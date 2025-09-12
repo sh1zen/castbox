@@ -53,7 +53,7 @@ impl SMutex {
 
     pub(crate) fn raw_unlock(&self) {
         self.state.store(UNLOCKED, Ordering::Release);
-        futex_wake(&self.state as *const _);
+        futex_wake(&self.state);
     }
 }
 

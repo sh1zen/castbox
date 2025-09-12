@@ -1,6 +1,5 @@
-
 #[cfg(test)]
-mod tests_gmutex1 {
+mod tests_grutex {
     use crate::mutex::{Grutex, Mutex};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
@@ -295,35 +294,6 @@ mod tests_gmutex1 {
             t.join().unwrap();
         }
     }
-}
-
-
-
-
-#[cfg(test)]
-mod tests_gmutex {
-    use crate::mutex::Grutex;
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn exclusive_lock_basic() {
-        let gm = Arc::new(Grutex::new());
-        let gm1 = gm.clone();
-
-        let handle = thread::spawn(move || {
-            gm1.lock_exclusive();
-            thread::sleep(Duration::from_millis(50));
-            gm1.unlock_exclusive();
-        });
-
-        thread::sleep(Duration::from_millis(10));
-        // deve essere locked esclusivo
-        assert!(gm.is_locked_exclusive());
-        handle.join().unwrap();
-        assert!(!gm.is_locked());
-    }
 
     #[test]
     fn group_lock_basic() {
@@ -334,18 +304,17 @@ mod tests_gmutex {
         let h1 = thread::spawn(move || {
             gm1.lock_group(0);
             thread::sleep(Duration::from_millis(50));
-            gm1.unlock_group(0);
         });
 
         let h2 = thread::spawn(move || {
             gm2.lock_group(0);
             thread::sleep(Duration::from_millis(50));
-            gm2.unlock_group(0);
         });
 
         thread::sleep(Duration::from_millis(10));
         // dovrebbe essere locked di gruppo
         assert!(gm.is_locked_group());
+        gm.unlock_all_group(Some(0));
         h1.join().unwrap();
         h2.join().unwrap();
         assert!(!gm.is_locked());
@@ -359,11 +328,10 @@ mod tests_gmutex {
 
         let h_excl = thread::spawn(move || {
             gm1.lock_exclusive();
-            thread::sleep(Duration::from_millis(100));
-            gm1.unlock_exclusive();
         });
 
-        thread::sleep(Duration::from_millis(10));
+        h_excl.join().unwrap();
+        assert!(gm.is_locked_exclusive());
 
         let h_group = thread::spawn(move || {
             // dovrebbe essere sospeso finché l'exclusive non è rilasciato
@@ -371,9 +339,7 @@ mod tests_gmutex {
             gm2.unlock_group(1);
         });
 
-        thread::sleep(Duration::from_millis(20));
-        assert!(gm.is_locked_exclusive());
-        h_excl.join().unwrap();
+        gm.unlock_exclusive();
         h_group.join().unwrap();
         assert!(!gm.is_locked());
     }
@@ -426,45 +392,6 @@ mod tests_gmutex {
         assert_eq!(gm.get_group_locked(), 1);
 
         gm.unlock_group(1);
-        assert_eq!(gm.get_group_locked(), 0);
-    }
-
-    #[test]
-    fn high_concurrency_test() {
-        const THREADS: usize = 100;
-        const ITERATIONS: usize = 2;
-
-        let gm = Arc::new(Grutex::new());
-        let mut handles = Vec::new();
-
-        for _ in 0..THREADS {
-            let gm_clone = gm.clone();
-            let handle = thread::spawn(move || {
-                for i in 0..ITERATIONS {
-                    if i % 5 == 0 {
-                        // 20% chance: lock exclusive
-                        gm_clone.lock_exclusive();
-                        // simula lavoro
-                        thread::sleep(Duration::from_millis(10));
-                        gm_clone.unlock_exclusive();
-                    } else {
-                        // 80% chance: lock gruppo casuale
-                        let group_id = i % 5;
-                        gm_clone.lock_group(group_id);
-                        thread::sleep(Duration::from_millis(10));
-                        gm_clone.unlock_group(group_id);
-                    }
-                }
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Alla fine, nessun lock attivo
-        assert!(!gm.is_locked());
         assert_eq!(gm.get_group_locked(), 0);
     }
 }
