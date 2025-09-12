@@ -1,5 +1,4 @@
 use crate::core::futex::{futex_wait, futex_wake};
-use std::hint::spin_loop;
 use std::sync::atomic;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, Thread};
@@ -72,19 +71,6 @@ impl ThreadParker {
     pub(crate) fn park(&self) {
         let inner = self.inner();
 
-        // Fast path: if we can consume a token immediately, return.
-        if inner.try_consume_token() {
-            return;
-        }
-
-        // Brief spin to catch a concurrent unpark without going to sleep.
-        for _ in 0..64 {
-            if inner.try_consume_token() {
-                return;
-            }
-            spin_loop();
-        }
-
         // Sleep path: double-check before and after sleeping to avoid races
         loop {
             // Re-check before sleeping to avoid missed wakeups.
@@ -107,8 +93,7 @@ impl ThreadParker {
     pub(crate) fn unpark(&self) {
         let inner = self.inner();
         // Add token (publish) and wake only if there were no available tokens.
-        let prev = inner.add_token();
-        if prev == PARKED {
+        if inner.add_token() == PARKED {
             // Ensure release-acquire ordering with park().
             futex_wake(&inner.tokens);
         }

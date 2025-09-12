@@ -20,7 +20,7 @@ const LOCKED_EXCLUSIVE: State = 1;
 const LOCKED_GROUP: State = 2;
 const DIRTY: State = 3;
 
-/// passo per codificare uno stato specifico di gruppo: LOCKED_GROUP + GROUP_STEP * n
+/// Step to encode a specific group state: LOCKED_GROUP + GROUP_STEP * n
 const GROUP_STEP: State = 5;
 
 #[inline]
@@ -41,30 +41,30 @@ fn decode_group_state(st: State) -> Option<usize> {
 }
 
 struct StateData {
-    // stato canonico (usato quando si tiene il Grutex)
+    // Canonical state (used while holding the Grutex)
     state: State,
-    // numero di thread attualmente 'in attesa' (come nella logica originale)
+    // Number of threads currently 'waiting' (as in the original logic)
     wakers: usize,
-    // contatori per tipo di gruppo; slot per tipo n è counts[n]
+    // Per-group counters; the slot for group n is counts[n]
     counts: Vec<usize>,
-    // Nota: non teniamo qui total_g_locked (è atomico nella struttura principale)
+    // Note: we don't keep total_g_locked here (it's atomic in the main struct)
 }
 
 struct InnerGrutex {
     state_grutex: SMutex,
     data: UnsafeCell<StateData>,
 
-    // condvar globale per notifiche su tutti i gruppi (usata quando serve "tutti")
+    // Global condvar for notifications across all groups (used for the "all" case)
     cvar_group: SCondVar,
-    // condvars per singolo tipo di gruppo (Arc per sicurezza durante wait fuori dal lock)
+    // Per-group condvars (Arc to be safe when waiting outside the lock)
     group_cvars: UnsafeCell<Vec<Option<Arc<SCondVar>>>>,
 
     cvar_exclusive: SCondVar,
     ref_count: AtomicUsize,
 
-    // primitive atomiche per letture hot-path:
-    // - state_atomic riflette lo stesso valore di `state` (ma può essere letto senza Grutex)
-    // - total_g_locked_atomic tiene il conteggio totale dei lockers di gruppo (somma su counts)
+    // Atomic fields for hot-path reads:
+    // - state_atomic mirrors the `state` value (can be read without the Grutex)
+    // - total_g_locked_atomic holds the total number of group lockers (sum of counts)
     state_atomic: AtomicUsize,
     total_g_locked_atomic: AtomicUsize,
 }
@@ -119,7 +119,7 @@ impl InnerGrutex {
         }
     }
 
-    /// get or create a Arc<SCondVar> for group n — must hold Grutex
+    /// get or create an Arc<SCondVar> for group n — must hold Grutex
     #[inline]
     fn get_or_create_group_cvar_arc(&self, n: usize) -> Arc<SCondVar> {
         let vec = unsafe { &mut *self.group_cvars.get() };
@@ -193,32 +193,32 @@ impl Grutex {
         self.inner().ref_count.load(Acquire)
     }
 
-    /// ritorna il conteggio totale di locker di gruppo — O(1) read atomica, lock-free
+    /// Returns the total number of group lockers — O(1) atomic read, lock-free
     pub fn get_group_locked(&self) -> usize {
         self.inner().total_g_locked_atomic.load(Acquire)
     }
 
-    /// ritorna il conteggio di locker per uno specifico tipo `n`
-    /// questa richiede il lock (perché i contatori per tipo sono nel Vec)
+    /// Returns the number of lockers for a specific group `n`
+    /// Requires the lock (per-group counters live in a Vec)
     pub fn get_group_locked_for(&self, n: usize) -> usize {
         let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
         if n < d.counts.len() { d.counts[n] } else { 0 }
     }
 
-    /// se c'è qualunque locker di gruppo (qualsiasi tipo) — lettura atomica veloce
+    /// Whether there is any group locker (any type) — fast atomic read
     pub fn is_locked_group(&self) -> bool {
         let st = self.inner().state_atomic.load(Acquire);
         let total = self.inner().total_g_locked_atomic.load(Acquire);
         st == LOCKED_GROUP || (st == DIRTY && total > 0) || decode_group_state(st).is_some()
     }
 
-    /// se è locked esclusivo — lettura atomica
+    /// Whether it is exclusively locked — atomic read
     pub fn is_locked_exclusive(&self) -> bool {
         self.inner().state_atomic.load(Acquire) == LOCKED_EXCLUSIVE
     }
 
-    /// se è locked (esclusivo o gruppi) — lettura atomica
+    /// Whether it is locked (exclusive or groups) — atomic read
     pub fn is_locked(&self) -> bool {
         let st = self.inner().state_atomic.load(Acquire);
         let total = self.inner().total_g_locked_atomic.load(Acquire);
@@ -254,7 +254,7 @@ impl Grutex {
         }
     }
 
-    /// lock di gruppo per il tipo `n`
+    /// Group lock for type `n`
     pub fn lock_group(&self, n: usize) {
         let mut guard = self.inner().state_grutex.lock();
 
@@ -266,14 +266,14 @@ impl Grutex {
 
             d.wakers = d.wakers.saturating_add(1);
 
-            // incrementa contatore per quel tipo (O(1, no hash)
+            // Increment counter for that type (O(1), no hash)
             d.counts[n] = d.counts[n].saturating_add(1);
 
-            // incrementa il contatore totale atomico (solo qui, sotto Grutex)
+            // Increment the total atomic counter (only here, under the Grutex)
             self.inner().total_g_locked_atomic.fetch_add(1, AcqRel);
         }
 
-        // prendi un Arc<SCondVar> stabile per questo gruppo mentre siamo sotto lock
+        // Grab a stable Arc<SCondVar> for this group while under the lock
         let gcv_arc = self.inner().get_or_create_group_cvar_arc(n);
 
         loop {
@@ -282,9 +282,9 @@ impl Grutex {
             {
                 let d = self.inner().data(&guard);
 
-                // consentiamo il lock di gruppo quando non è presente LOCKED_EXCLUSIVE
+                // Allow group locking when LOCKED_EXCLUSIVE is not present
                 if d.state != LOCKED_EXCLUSIVE {
-                    // aggiorna lo stato: se ora c'è un solo tipo di gruppo lockato -> impostalo
+                    // Update state: if only one group type is locked now -> set specific state
                     // compute number of non-zero slots cheaply: we can check total atomics and counts.len()
                     // but simplest: check how many slots are non-zero by scanning counts if counts.len is small.
                     // To avoid O(k) here, use heuristic: if total==d.counts[n], then only this group has locks.
@@ -295,10 +295,10 @@ impl Grutex {
                         d.state = LOCKED_GROUP;
                     }
 
-                    // manteniamo coerente lo stato atomico
+                    // Keep the atomic state in sync
                     self.inner().state_atomic.store(d.state, Release);
 
-                    // Notifica in modo mirato: preferisco notificare la condvar del gruppo
+                    // Targeted notify: prefer notifying the group's condvar
                     gcv_arc.notify_all();
 
                     d.wakers = d.wakers.saturating_sub(1);
@@ -310,12 +310,12 @@ impl Grutex {
                 break;
             }
 
-            // adesso il borrow di d è terminato, quindi possiamo riassegnare guard
+            // The borrow of `d` has ended, so we can reassign `guard`
             guard = gcv_arc.wait(guard);
         }
     }
 
-    /// unlock di gruppo per il tipo `n`
+    /// Group unlock for type `n`
     pub fn unlock_group(&self, n: usize) {
         let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
@@ -324,7 +324,7 @@ impl Grutex {
             panic!("Trying to unlock a non Locked Group {}", d.state);
         }
 
-        // decrementa wakers (come prima)
+        // Decrement wakers (as before)
         d.wakers = d.wakers.saturating_sub(1);
 
         if n >= d.counts.len() {
@@ -339,19 +339,19 @@ impl Grutex {
             panic!("Trying to unlock group type {} which had zero lockers", n);
         }
         d.counts[n] = prev - 1;
-        // aggiorna contatore totale atomico
+        // Update the total atomic counter
         self.inner().total_g_locked_atomic.fetch_sub(1, AcqRel);
 
         if d.counts[n] == 0 {
             // keep slot zero, do not shrink vectors
         }
 
-        // aggiorna lo stato in base al numero di gruppi rimanenti
+        // Update state based on the number of groups remaining
         let total_after = self.inner().total_g_locked_atomic.load(Acquire);
         if total_after == 0 {
             d.state = DIRTY;
         } else {
-            // se solo un gruppo rimane con contatori >0, vogliamo settare group_state(only_n)
+            // If only one group remains with count > 0, set group_state(only_n)
             // fast path: if d.counts[n] == total_after then other groups are zero
             // but n may be not the only one; we find any single non-zero slot if needed.
             // attempt fast detection: if total_after == d.counts.iter().sum() (but sum is O(k))
@@ -386,11 +386,11 @@ impl Grutex {
             }
         }
 
-        // aggiorna lo stato atomico
+        // Update the atomic state
         self.inner().state_atomic.store(d.state, Release);
 
-        // risveglia: se non ci sono più lockers di qualsiasi tipo, risvegliamo l'exclusive;
-        // inoltre notifichiamo il gruppo appena sbloccato e la condvar globale
+        // Wakeups: if there are no lockers of any kind, wake the exclusive waiter;
+        // also notify the just-unlocked group and the global condvar
         self.inner().cvar_exclusive.notify_one();
         if let Some(gcv_arc) = self.inner().get_group_cvar_if_exists_arc(n) {
             gcv_arc.notify_all();
@@ -407,7 +407,7 @@ impl Grutex {
             panic!("Is not Locked Exclusive (state = {})", d.state);
         }
 
-        // aggiorna stato in base ai gruppi presenti (usando total_g_locked_atomic O(1))
+        // Update state based on present groups (using total_g_locked_atomic, O(1))
         let total = self.inner().total_g_locked_atomic.load(Acquire);
         if total == 0 {
             d.state = UNLOCKED;
@@ -431,20 +431,20 @@ impl Grutex {
             }
         }
 
-        // aggiorna l'atomico dopo la modifica canonica sotto Grutex
+        // Update the atomic after the canonical change under the Grutex
         self.inner().state_atomic.store(d.state, Release);
 
         d.wakers = d.wakers.saturating_sub(1);
 
-        // Notifica mirata: preferisco notificare i gruppi esistenti invece di tutto il mondo
+        // Targeted notifications: prefer notifying existing groups instead of everyone
         self.inner().notify_all_group_cvars();
         self.inner().cvar_group.notify_all();
         self.inner().cvar_exclusive.notify_one();
     }
 
-    /// azzera tutti i locker di gruppo o solo il tipo passato (Some(n)).
-    /// - Some(n): azzera solo il gruppo n
-    /// - None: azzera tutti i gruppi (comportamento 'tutti')
+    /// Reset all group lockers or only the specified type (Some(n)).
+    /// - Some(n): reset only group n
+    /// - None: reset all groups (the 'all' behavior)
     pub fn unlock_all_group(&self, target: Option<usize>) {
         let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
@@ -500,7 +500,7 @@ impl Grutex {
             }
         }
 
-        // aggiorna atomico
+        // Update the atomic
         self.inner().state_atomic.store(d.state, Release);
 
         // notify appropriate condvars
@@ -518,8 +518,8 @@ impl Grutex {
         self.inner().cvar_exclusive.notify_one();
     }
 
-    /// sospende un thread in attesa per Exclusive o Group.
-    /// Se `group_id` è Some(n), aspetta sulla condvar del gruppo n; altrimenti sulla condvar globale.
+    /// Suspend a thread waiting for Exclusive or Group.
+    /// If `group_id` is Some(n), wait on group n's condvar; otherwise on the global condvar.
     pub(crate) fn suspend(&self, t: GrutexType, group_id: Option<usize>) -> bool {
         let guard = self.inner().state_grutex.lock();
         let d = self.inner().data(&guard);
@@ -534,7 +534,7 @@ impl Grutex {
             GrutexType::Group => {
                 match group_id {
                     Some(n) => {
-                        // prendi Arc qui (sotto lock) e poi aspetta su di essa
+                        // Take the Arc here (under the lock) then wait on it
                         if let Some(gcv_arc) = self.inner().get_group_cvar_if_exists_arc(n) {
                             let _ = gcv_arc.wait(guard);
                         } else {
