@@ -265,19 +265,34 @@ impl<T> Drop for AtomicVec<T> {
             let ptr = self.ptr as *mut AtomicInner<T>;
 
             unsafe {
-                let mut head = (*ptr).head.load(Ordering::Acquire);
-                loop {
-                    if head.is_null() {
-                        break;
-                    }
-                    let next = (*head).next.load(Ordering::Acquire);
-                    ManuallyDrop::drop(&mut (*head).value);
-                    drop(Box::from_raw(head));
-                    head = next;
-                }
-            }
+                // Prima: estrai la head e la t_tail, così non perdi nodi pendenti.
+                let head = (*ptr).head.swap(null_mut(), Ordering::Acquire);
+                let pending = (*ptr).t_tail.swap(null_mut(), Ordering::Acquire);
 
-            unsafe { drop(Box::from_raw(ptr)) };
+                // 1) Free head chain
+                let mut cur = head;
+                while !cur.is_null() {
+                    let next = (*cur).next.load(Ordering::Acquire);
+                    // Se il valore è ManuallyDrop, facciamo il drop corretto.
+                    ManuallyDrop::drop(&mut (*cur).value);
+                    drop(Box::from_raw(cur));
+                    cur = next;
+                }
+
+                // 2) Free pending chain (t_tail) se diverso da head
+                if !pending.is_null() && pending != head {
+                    let mut cur2 = pending;
+                    while !cur2.is_null() {
+                        let next2 = (*cur2).next.load(Ordering::Acquire);
+                        ManuallyDrop::drop(&mut (*cur2).value);
+                        drop(Box::from_raw(cur2));
+                        cur2 = next2;
+                    }
+                }
+
+                // Infine dealloca la struttura AtomicInner in sè
+                drop(Box::from_raw(ptr));
+            }
         }
     }
 }
