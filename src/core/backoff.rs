@@ -1,6 +1,7 @@
 use core::cell::Cell;
 use core::fmt;
 use std::{hint, thread};
+use std::hint::spin_loop;
 
 const SPIN_LIMIT: u32 = 6;
 const YIELD_LIMIT: u32 = 10;
@@ -17,7 +18,7 @@ const YIELD_LIMIT: u32 = 10;
 /// Each step takes roughly twice as long as the previous one.
 ///
 /// Example
-/// ```rust,ignore
+/// ```rust
 /// let backoff = Backoff::new();
 /// loop {
 ///     if try_do_something() {
@@ -118,6 +119,23 @@ impl Backoff {
     #[inline]
     pub(crate) fn is_yielding(&self) -> bool {
         self.step.get() >= SPIN_LIMIT
+    }
+
+    #[inline]
+    pub(crate) fn cpu_relax(mut counter: u32) {
+        if counter >= 10 {
+            return;
+        }
+
+        counter += 1;
+
+        if counter <= 3 {
+            for _ in 0..(1 << counter) {
+                spin_loop();
+            }
+        } else {
+            thread::yield_now();
+        }
     }
 }
 

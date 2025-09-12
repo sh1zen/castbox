@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests_grutex {
-    use crate::mutex::{Grutex, Mutex};
+    use crate::mutex::Grutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -193,7 +193,7 @@ mod tests_grutex {
 
     #[test]
     fn exclusives_are_mutually_exclusive() {
-        let m = Mutex::new();
+        let m = Grutex::new();
         let inside = Arc::new(AtomicBool::new(false));
         let ok = Arc::new(AtomicBool::new(true));
 
@@ -303,20 +303,19 @@ mod tests_grutex {
 
         let h1 = thread::spawn(move || {
             gm1.lock_group(0);
-            thread::sleep(Duration::from_millis(50));
         });
 
         let h2 = thread::spawn(move || {
             gm2.lock_group(0);
-            thread::sleep(Duration::from_millis(50));
         });
 
-        thread::sleep(Duration::from_millis(10));
+        h1.join().unwrap();
+        h2.join().unwrap();
+
         // dovrebbe essere locked di gruppo
         assert!(gm.is_locked_group());
         gm.unlock_all_group(Some(0));
-        h1.join().unwrap();
-        h2.join().unwrap();
+
         assert!(!gm.is_locked());
     }
 

@@ -1,4 +1,5 @@
 use crate::core::futex::{futex_wait, futex_wake};
+use crate::mutex::Backoff;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const UNLOCKED: usize = 0;
@@ -27,26 +28,45 @@ impl SMutex {
     pub(crate) fn raw_lock(&self) {
         if self
             .state
-            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+            .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
         {
-            return;
+            self.lock_exclusive_slow();
         }
+    }
 
-        // Altrimenti entriamo in attesa
+    #[inline]
+    fn lock_exclusive_slow(&self) {
         loop {
-            // Aspettiamo finché lo stato rimane LOCKED
-            while self.state.load(Ordering::Relaxed) == LOCKED {
-                futex_wait(&self.state, LOCKED);
+            let spin = Backoff::new();
+            let mut state = self.state.load(Ordering::Relaxed);
+
+            while state == UNLOCKED {
+                match self.state.compare_exchange_weak(
+                    UNLOCKED,
+                    LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return,
+                    Err(e) => state = e,
+                }
             }
 
-            // Ritentiamo l'acquisizione
-            if self
-                .state
-                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
+            if state == LOCKED {
+                if !spin.is_yielding() {
+                    spin.snooze();
+                    continue;
+                }
+
+                loop {
+                    // Aspettiamo finché lo stato rimane LOCKED
+                    while self.state.load(Ordering::Relaxed) == LOCKED {
+                        futex_wait(&self.state, LOCKED);
+                    }
+
+                    break;
+                }
             }
         }
     }

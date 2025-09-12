@@ -1,8 +1,7 @@
 use crate::mutex::{Backoff, Mutex, WatchGuardMut, WatchGuardRef};
 use std::borrow::Borrow;
-use std::collections::hash_map::DefaultHasher;
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::mem::ManuallyDrop;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::{self, null_mut};
@@ -11,7 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 const BUCKET_AVAILABLE: bool = true;
 const BUCKET_UPDATING: bool = false;
-const DEFAULT_BUCKETS: usize = 256;
+const DEFAULT_BUCKETS: usize = 64;
+
+const LOAD_FACTOR: f64 = 0.75;
 
 struct Item<K, V> {
     key: K,
@@ -67,25 +68,26 @@ impl<K, V> Bucket<K, V> {
     }
 }
 
-struct AtomicInner<K, V> {
+struct AtomicInner<K, V, S> {
     buckets: Vec<Bucket<K, V>>,
     lock: Mutex,
     len: AtomicUsize,
     ref_count: AtomicUsize,
+    hasher: S,
 }
 
 #[repr(transparent)]
-pub struct AtomicHashMap<K, V> {
-    ptr: *const AtomicInner<K, V>,
+pub struct AtomicHashMap<K, V, S = RandomState> {
+    ptr: *const AtomicInner<K, V, S>,
 }
 
-unsafe impl<K: Send, V: Send> Send for AtomicHashMap<K, V> {}
-unsafe impl<K: Send, V: Send> Sync for AtomicHashMap<K, V> {}
+unsafe impl<K: Send, V: Send, S> Send for AtomicHashMap<K, V, S> {}
+unsafe impl<K: Send, V: Send, S> Sync for AtomicHashMap<K, V, S> {}
 
-impl<K, V> UnwindSafe for AtomicHashMap<K, V> {}
-impl<K, V> RefUnwindSafe for AtomicHashMap<K, V> {}
+impl<K, V, S> UnwindSafe for AtomicHashMap<K, V, S> {}
+impl<K, V, S> RefUnwindSafe for AtomicHashMap<K, V, S> {}
 
-impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
+impl<K: Eq + Hash, V> AtomicHashMap<K, V, RandomState> {
     /// Create a new AtomicHashMap with default buckets size
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_BUCKETS)
@@ -99,17 +101,24 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
             len: AtomicUsize::new(0),
             ref_count: AtomicUsize::new(1),
             lock: Mutex::new(),
+            hasher: RandomState::default(),
         }));
         Self { ptr }
     }
+}
 
+impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
     #[inline(always)]
-    fn inner(&self) -> &AtomicInner<K, V> {
+    fn inner(&self) -> &AtomicInner<K, V, S> {
         unsafe { &*self.ptr }
     }
 
-    fn hash<Q: ?Sized + Hash>(key: &Q) -> u64 {
-        let mut hasher = DefaultHasher::new();
+    pub fn hasher(&self) -> &S {
+        &self.inner().hasher
+    }
+
+    fn hash<Q: ?Sized + Hash>(&self, key: &Q) -> u64 {
+        let mut hasher = self.inner().hasher.build_hasher();
         key.hash(&mut hasher);
         hasher.finish()
     }
@@ -117,14 +126,10 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
     pub fn insert(&self, key: K, value: V) {
         let bucket = self.find_bucket(&key).unwrap();
 
-        // handle iter locking
         self.inner().lock.lock_group();
-        // lock current bucket
         bucket.lock();
 
         let head = bucket.head.load(Ordering::Acquire);
-
-        // check if key exists → update
         let mut cur = head;
         while !cur.is_null() {
             unsafe {
@@ -141,7 +146,6 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
             }
         }
 
-        // prepend new
         let new_item = Item::new(key, value);
         unsafe { (*new_item).next.store(head, Ordering::Release) };
         bucket.head.store(new_item, Ordering::Release);
@@ -149,6 +153,9 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
 
         self.inner().len.fetch_add(1, Ordering::Relaxed);
         self.inner().lock.unlock_group();
+
+        // qui controlliamo se ridimensionare
+        self.maybe_resize();
     }
 
     pub fn get<Q: ?Sized>(&self, key: &Q) -> Option<WatchGuardRef<'_, V>>
@@ -265,7 +272,7 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let h = Self::hash(key);
+        let h = self.hash(key);
         let bucket_idx = h as usize % self.inner().buckets.len();
         let bucket = &self.inner().buckets[bucket_idx];
 
@@ -277,7 +284,61 @@ impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
     }
 }
 
-impl<K, V> Clone for AtomicHashMap<K, V> {
+impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
+    fn maybe_resize(&self) {
+        let inner = self.inner();
+        let len = inner.len.load(Ordering::Acquire);
+        let cap = inner.buckets.len();
+
+        if (len as f64) >= (cap as f64 * LOAD_FACTOR) {
+            self.resize();
+        }
+    }
+
+    fn resize(&self) {
+        let inner = self.inner();
+
+        // blocco esclusivo globale
+        inner.lock.lock_exclusive();
+
+        let old_buckets = &inner.buckets;
+        let new_cap = old_buckets.len() * 2;
+        let new_buckets: Vec<Bucket<K, V>> = (0..new_cap).map(|_| Bucket::new()).collect();
+
+        // reinserimento degli item
+        for bucket in old_buckets {
+            let mut cur = bucket.head.load(Ordering::Acquire);
+            while !cur.is_null() {
+                unsafe {
+                    let item = &*cur;
+                    let h = {
+                        let mut hasher = inner.hasher.build_hasher();
+                        item.key.hash(&mut hasher);
+                        hasher.finish() as usize % new_cap
+                    };
+
+                    let new_bucket = &new_buckets[h];
+                    let next = item.next.load(Ordering::Acquire);
+
+                    // prepend
+                    item.next
+                        .store(new_bucket.head.load(Ordering::Acquire), Ordering::Release);
+                    new_bucket.head.store(cur, Ordering::Release);
+
+                    cur = next;
+                }
+            }
+        }
+
+        // sostituiamo i bucket
+        let inner_mut = unsafe { &mut *(self.ptr as *mut AtomicInner<K, V, S>) };
+        inner_mut.buckets = new_buckets;
+
+        inner.lock.unlock_exclusive();
+    }
+}
+
+impl<K, V, S> Clone for AtomicHashMap<K, V, S> {
     fn clone(&self) -> Self {
         let inner = unsafe { &*self.ptr };
         inner.ref_count.fetch_add(1, Ordering::Relaxed);
@@ -285,7 +346,7 @@ impl<K, V> Clone for AtomicHashMap<K, V> {
     }
 }
 
-impl<K, V> Drop for AtomicHashMap<K, V> {
+impl<K, V, S> Drop for AtomicHashMap<K, V, S> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.ptr };
         if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
@@ -302,12 +363,12 @@ impl<K, V> Drop for AtomicHashMap<K, V> {
                 }
             }
 
-            unsafe { drop(Box::from_raw(self.ptr as *mut AtomicInner<K, V>)) };
+            unsafe { drop(Box::from_raw(self.ptr as *mut AtomicInner<K, V, S>)) };
         }
     }
 }
 
-impl<K, V> fmt::Debug for AtomicHashMap<K, V> {
+impl<K, V, S> fmt::Debug for AtomicHashMap<K, V, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = unsafe { &*self.ptr };
         f.debug_struct("AtomicHashMap")
@@ -317,14 +378,14 @@ impl<K, V> fmt::Debug for AtomicHashMap<K, V> {
     }
 }
 
-pub struct Iter<'a, K, V> {
-    map: &'a AtomicHashMap<K, V>,
+pub struct Iter<'a, K, V, S> {
+    map: &'a AtomicHashMap<K, V, S>,
     bucket_idx: usize,
     current: *mut Item<K, V>,
 }
 
-impl<'a, K: Eq + Hash, V> Iter<'a, K, V> {
-    fn new(map: &'a AtomicHashMap<K, V>) -> Self {
+impl<'a, K: Eq + Hash, V, S: BuildHasher + Clone> Iter<'a, K, V, S> {
+    fn new(map: &'a AtomicHashMap<K, V, S>) -> Self {
         let mut it = Iter {
             map,
             bucket_idx: 0,
@@ -346,7 +407,7 @@ impl<'a, K: Eq + Hash, V> Iter<'a, K, V> {
     }
 }
 
-impl<'a, K: Eq + Hash, V> Iterator for Iter<'a, K, V> {
+impl<'a, K: Eq + Hash, V, S: BuildHasher + Clone> Iterator for Iter<'a, K, V, S> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -377,14 +438,14 @@ impl<'a, K: Eq + Hash, V> Iterator for Iter<'a, K, V> {
     }
 }
 
-impl<K: Eq + Hash, V> AtomicHashMap<K, V> {
-    pub fn iter(&self) -> Iter<'_, K, V> {
+impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
+    pub fn iter(&self) -> Iter<'_, K, V, S> {
         self.inner().lock.lock_exclusive();
         Iter::new(self)
     }
 }
 
-impl<'a, K, V> Drop for Iter<'a, K, V> {
+impl<'a, K, V, S> Drop for Iter<'a, K, V, S> {
     fn drop(&mut self) {
         unsafe {
             (&*self.map.ptr).lock.unlock_exclusive();
