@@ -19,7 +19,7 @@
 
 **AtomicHashMap** is a thread-safe, concurrent hash map in Rust that supports high-performance insertion, retrieval, and removal of key-value pairs. It uses fine-grained atomic operations combined with internal mutexes to manage contention efficiently.
 
-- 🧠 Ideal for shared caches, state maps, and runtime-managed data
+- 🧠 Ideal for Shared caches, state maps, and runtime-managed data
 
 ## ✨ AtomicChain — Multi value Hash Map 
 
@@ -32,7 +32,7 @@
 
 **Arw** is an atomic smart pointer with fine-grained internal locking and strong/weak reference counting. It provides safe data sharing across threads, controlled concurrent access, and raw pointer conversions without relying on kernel-level mutexes.
 
-- 🧠 Suitable for shared data structures, caches, and custom concurrent primitives
+- 🧠 Suitable for Shared data structures, caches, and custom concurrent primitives
 
 ## ✨ AnyRef — Runtime-Typed Reference-Counted Smart Pointer 
 

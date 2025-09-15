@@ -116,7 +116,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
     pub fn insert(&self, key: K, value: V) {
         let bucket = self.find_bucket(&key).unwrap();
 
-        self.inner().lock.lock_group();
+        self.inner().lock.lock_shared();
         bucket.lock();
 
         let head = bucket.head.load(Ordering::Acquire);
@@ -145,7 +145,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
 
         bucket.release();
         self.inner().len.fetch_add(1, Ordering::Relaxed);
-        self.inner().lock.unlock_group();
+        self.inner().lock.unlock_shared();
     }
 
     /// Return first value associated to the key (FIFO)
@@ -155,17 +155,17 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
         Q: Hash + Eq,
     {
         let bucket = self.find_bucket(key)?;
-        self.inner().lock.lock_group();
+        self.inner().lock.lock_shared();
         bucket.lock();
 
         let mut cur = bucket.head.load(Ordering::Acquire);
         while !cur.is_null() {
             unsafe {
                 if (*cur).key.borrow() == key {
-                    bucket.ref_locked.lock_group();
+                    bucket.ref_locked.lock_shared();
                     let w_ref = WatchGuardRef::new(&*(*cur).value, bucket.ref_locked.clone());
                     bucket.release();
-                    self.inner().lock.unlock_group();
+                    self.inner().lock.unlock_shared();
                     return Some(w_ref);
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
@@ -173,7 +173,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
         }
 
         bucket.release();
-        self.inner().lock.unlock_group();
+        self.inner().lock.unlock_shared();
         None
     }
 
@@ -189,14 +189,14 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
             None => return results,
         };
 
-        self.inner().lock.lock_group();
+        self.inner().lock.lock_shared();
         bucket.lock();
 
         let mut cur = bucket.head.load(Ordering::Acquire);
         while !cur.is_null() {
             unsafe {
                 if (*cur).key.borrow() == key {
-                    bucket.ref_locked.lock_group();
+                    bucket.ref_locked.lock_shared();
                     results.push(WatchGuardRef::new(
                         &*(*cur).value,
                         bucket.ref_locked.clone(),
@@ -208,7 +208,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
         }
 
         bucket.release();
-        self.inner().lock.unlock_group();
+        self.inner().lock.unlock_shared();
         results
     }
 
@@ -220,7 +220,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
     {
         let bucket = self.find_bucket(key)?;
 
-        self.inner().lock.lock_group();
+        self.inner().lock.lock_shared();
         bucket.lock();
 
         let mut cur = bucket.head.load(Ordering::Acquire);
@@ -244,7 +244,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
                     let val = ManuallyDrop::into_inner(ptr::read(&(*cur).value));
                     drop(Box::from_raw(cur));
                     bucket.ref_locked.unlock_exclusive();
-                    self.inner().lock.unlock_group();
+                    self.inner().lock.unlock_shared();
                     return Some(val);
                 }
                 prev = cur;
@@ -253,7 +253,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
         }
 
         bucket.release();
-        self.inner().lock.unlock_group();
+        self.inner().lock.unlock_shared();
         None
     }
 

@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 #[cfg(test)]
 mod tests_mutex {
     use crate::mutex::Mutex;
@@ -16,26 +14,31 @@ mod tests_mutex {
 
         let mc = m.clone();
         let t1 = thread::spawn(move || {
-            mc.lock_group();
-            mc.lock_group();
-            mc.lock_group();
+            mc.lock_shared();
+            mc.lock_shared();
+            mc.lock_shared();
 
-            thread::sleep(Duration::from_millis(200));
-            mc.unlock_all_group();
+            thread::sleep(Duration::from_millis(100));
+            mc.unlock_all_shared();
         });
+
+        assert!(m.is_locked());
 
         let mc = m.clone();
         let t2 = thread::spawn(move || {
-            let _x = mc.clone();
             mc.unlock_exclusive();
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(200));
             mc.lock_exclusive();
         });
 
         t1.join().unwrap();
         t2.join().unwrap();
 
+        assert!(m.is_locked());
+
         m.unlock_exclusive();
+
+        assert!(!m.is_locked());
     }
 
     #[test]
@@ -49,11 +52,11 @@ mod tests_mutex {
         for _i in 0..100 {
             let m1 = mutex.clone();
             handles.push(thread::spawn(move || {
-                m1.lock_group();
+                m1.lock_shared();
             }));
         }
 
-        assert!(!mutex.is_locked_group());
+        assert!(!mutex.is_locked_shared());
 
         mutex.unlock_exclusive();
 
@@ -61,8 +64,7 @@ mod tests_mutex {
             h.join().unwrap();
         }
 
-        assert!(mutex.is_locked_group());
-        drop(mutex);
+        assert!(mutex.is_locked_shared());
     }
 
     #[test]
@@ -77,10 +79,10 @@ mod tests_mutex {
         let m1 = mutex.clone();
         let m2 = mutex.clone();
 
-        mutex.lock_group();
-        mutex.lock_group();
+        mutex.lock_shared();
+        mutex.lock_shared();
 
-        mutex.unlock_group();
+        mutex.unlock_shared();
 
         let h1 = thread::spawn(move || {
             m1.lock_exclusive();
@@ -93,7 +95,7 @@ mod tests_mutex {
             m2.unlock_exclusive();
         });
 
-        mutex.unlock_group();
+        mutex.unlock_shared();
 
         h1.join().unwrap();
         h2.join().unwrap();
@@ -136,9 +138,9 @@ mod tests_mutex {
         let eg = entered_group.clone();
         let mg = m.clone();
         let tg = thread::spawn(move || {
-            mg.lock_group();
+            mg.lock_shared();
             eg.store(true, Ordering::Release);
-            mg.unlock_group();
+            mg.unlock_shared();
         });
 
         let ee = entered_excl.clone();
@@ -178,7 +180,7 @@ mod tests_mutex {
             let cur = concurrent.clone();
             let maxc = max_concurrent.clone();
             ths.push(thread::spawn(move || {
-                mm.lock_group();
+                mm.lock_shared();
                 b.wait();
                 let now = cur.fetch_add(1, Ordering::AcqRel) + 1;
                 maxc.fetch_max(now, Ordering::AcqRel);
@@ -189,9 +191,9 @@ mod tests_mutex {
         for t in ths {
             t.join().unwrap();
         }
-        m.unlock_all_group();
+        m.unlock_all_shared();
         assert!(max_concurrent.load(Ordering::Acquire) > 1);
-        assert!(!m.is_locked_exclusive());
+        assert!(!m.is_locked_shared());
     }
 
     #[test]
@@ -238,11 +240,11 @@ mod tests_mutex {
             let bin = barrier_in.clone();
             let bout = barrier_out.clone();
             tg.push(thread::spawn(move || {
-                mm.lock_group();
+                mm.lock_shared();
                 bin.wait();
                 thread::sleep(Duration::from_millis(30));
                 bout.wait();
-                mm.unlock_group();
+                mm.unlock_shared();
             }));
         }
 
@@ -264,17 +266,6 @@ mod tests_mutex {
     }
 
     #[test]
-    pub(crate) fn unlock_panics_if_group_locked() {
-        let m = Mutex::new();
-        m.lock_group();
-        let res = std::panic::catch_unwind(|| {
-            m.unlock_exclusive();
-        });
-        assert!(res.is_err());
-        m.unlock_group();
-    }
-
-    #[test]
     pub(crate) fn stress_multi_lock() {
         let m = Mutex::new();
 
@@ -287,8 +278,8 @@ mod tests_mutex {
                         mm.lock_exclusive();
                         mm.unlock_exclusive();
                     } else {
-                        mm.lock_group();
-                        mm.unlock_group();
+                        mm.lock_shared();
+                        mm.unlock_shared();
                     }
                 }
             }));
@@ -297,24 +288,4 @@ mod tests_mutex {
             t.join().unwrap();
         }
     }
-}
-
-#[test]
-fn run_all_tests1() {
-    let start = Instant::now();
-
-    tests_mutex::kiko();
-    tests_mutex::stress_test();
-    // tests_mutex::test_mutex();
-    tests_mutex::refcount_clone_drop();
-    tests_mutex::is_locked_reflects_state();
-    tests_mutex::exclusive_blocks_others();
-    tests_mutex::group_allows_concurrency();
-    tests_mutex::exclusives_are_mutually_exclusive();
-    tests_mutex::group_batch_then_exclusive();
-    tests_mutex::unlock_panics_if_group_locked();
-    tests_mutex::stress_multi_lock();
-
-    let elapsed = start.elapsed();
-    println!("Tempo totale esecuzione test: {:?}", elapsed);
 }

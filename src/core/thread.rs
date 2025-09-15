@@ -8,7 +8,7 @@ type State = usize;
 const PARKED: State = 0;
 const UNPARKED: State = 1;
 
-/// Parker inner state; shared via Arc to avoid use-after-free.
+/// Parker inner state; Shared via Arc to avoid use-after-free.
 struct ThreadInner {
     /// Number of available tokens (permits). Do not use negative values as persistent state.
     tokens: AtomicUsize,

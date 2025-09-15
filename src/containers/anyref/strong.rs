@@ -283,14 +283,14 @@ impl AnyRef {
     pub fn try_downcast_ref<U: Any>(&self) -> Option<WatchGuardRef<'_, U>> {
         if self.inner().type_id == TypeId::of::<U>() {
             let lock = self.inner().lock.clone();
-            lock.lock_group();
+            lock.lock_shared();
             
             let data = self.inner().get_ref().downcast_ref::<U>();
 
             match data {
                 Some(t) => Some(WatchGuardRef::new(t, lock)),
                 None => {
-                    lock.unlock_group();
+                    lock.unlock_shared();
                     None
                 }
             }
