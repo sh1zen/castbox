@@ -86,12 +86,13 @@ impl Backoff {
     /// the OS; for that, prefer [`snooze`].
     #[inline]
     pub(crate) fn spin(&self) {
-        for _ in 0..1 << self.step.get().min(self.spin_limit) {
+        let spins = self.step.get();
+        for _ in 0..1 << spins.min(self.spin_limit) {
             hint::spin_loop();
         }
 
-        if self.step.get() <= self.spin_limit {
-            self.step.set(self.step.get() + 1);
+        if spins <= self.spin_limit {
+            self.step.set(spins + 1);
         }
     }
 
@@ -116,16 +117,17 @@ impl Backoff {
     /// a blocking synchronization primitive instead.
     #[inline]
     pub(crate) fn snooze(&self) {
-        if self.step.get() <= self.spin_limit {
-            for _ in 0..1 << self.step.get() {
+        let spins = self.step.get();
+        if spins <= self.spin_limit {
+            for _ in 0..1 << spins {
                 hint::spin_loop();
             }
         } else {
             thread::yield_now();
         }
 
-        if self.step.get() <= self.yield_limit {
-            self.step.set(self.step.get() + 1);
+        if spins <= self.yield_limit {
+            self.step.set(spins + 1);
         }
     }
 

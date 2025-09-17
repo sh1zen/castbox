@@ -1,19 +1,20 @@
 use crate::core::futex::{futex_wait, futex_wake};
 use crate::mutex::Backoff;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use crossbeam_utils::CachePadded;
 
 const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;
 const GROUP_FLAG: usize = 2; // indica che ci sono lock di gruppo attivi
 
 pub(crate) struct SMutex {
-    state: AtomicUsize,
+    state: CachePadded<AtomicUsize>,
 }
 
 impl SMutex {
     pub(crate) fn new() -> Self {
         Self {
-            state: AtomicUsize::new(UNLOCKED),
+            state: CachePadded::new(AtomicUsize::new(UNLOCKED)),
         }
     }
 
@@ -106,12 +107,12 @@ impl SMutex {
 
     pub(crate) fn raw_unlock(&self) {
         self.state.fetch_and(!LOCKED, Ordering::Release);
-        futex_wake(&self.state);
+        futex_wake(&*self.state);
     }
 
     pub(crate) fn raw_unlock_group(&self) {
         self.state.fetch_and(!GROUP_FLAG, Ordering::Release);
-        futex_wake(&self.state);
+        futex_wake(&*self.state);
     }
 }
 

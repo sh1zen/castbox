@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 type State = usize;
 
 /// Internal bit flags for the mutex state.
-/// Inspired by RawRwLock implementation.
 const UNLOCKED: State = 0;
 const READERS_PARKED: State = 0b0001;
 const WRITERS_PARKED: State = 0b0010;
@@ -19,12 +18,12 @@ const ONE_WRITER: State = !(READERS_PARKED | WRITERS_PARKED);
 struct InnerMutex {
     /// Main mutex state (reader/writer)
     state: CachePadded<AtomicUsize>,
-    /// Reference counter, updated infrequently
-    ref_count: AtomicUsize,
     /// Futex for readers
     readers_futex: CachePadded<AtomicUsize>,
     /// Futex for writers
     writers_futex: CachePadded<AtomicUsize>,
+    /// Reference counter, updated infrequently
+    ref_count: AtomicUsize,
 }
 
 #[inline]
@@ -95,7 +94,7 @@ impl Mutex {
     /// Returns true if the mutex is locked in shared mode (reader lock)
     #[inline]
     pub fn is_locked_shared(&self) -> bool {
-        let s = self.inner().state.load(Ordering::Relaxed);
+        let s = self.inner().state.load(Ordering::Acquire);
         !is_writer_locked(s) && readers_count(s) > 0
     }
 
@@ -118,7 +117,7 @@ impl Mutex {
         if self
             .inner()
             .state
-            .compare_exchange_weak(UNLOCKED, ONE_WRITER, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(UNLOCKED, ONE_WRITER, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             self.lock_exclusive_slow();
@@ -241,7 +240,7 @@ impl Mutex {
             if new_state & ONE_WRITER != ONE_WRITER {
                 return inner
                     .state
-                    .compare_exchange_weak(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                    .compare_exchange(state, new_state, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok();
             }
         }
@@ -290,7 +289,7 @@ impl Mutex {
         if prev_state == (ONE_READER | WRITERS_PARKED) {
             if inner
                 .state
-                .compare_exchange(WRITERS_PARKED, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(WRITERS_PARKED, UNLOCKED, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
                 inner.writers_futex.fetch_add(1, Ordering::Release);
@@ -436,7 +435,7 @@ impl fmt::Debug for Mutex {
         let state = self.inner().state.load(Ordering::Acquire);
         let readers = readers_count(state);
 
-        f.debug_struct("ImprovedMutex")
+        f.debug_struct("Mutex")
             .field("state", &format!("{:b}", state))
             .field("exclusive_locked", &self.is_locked_exclusive())
             .field("readers_count", &readers)

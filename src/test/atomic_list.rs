@@ -1,14 +1,14 @@
-mod tests_atomic_vec {
+mod tests_atomic_list {
     use std::sync::{Arc, Barrier};
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
-    use crate::collections::AtomicVec;
+    use crate::collections::AtomicList;
 
     #[test]
     fn stress_test() {
         let started = Instant::now();
-        let vec = AtomicVec::new();
+        let vec = AtomicList::new();
         let vec_c = vec.clone();
 
         vec_c.push(10);
@@ -46,14 +46,14 @@ mod tests_atomic_vec {
 
     #[test]
     fn new_is_empty() {
-        let v: AtomicVec<i32> = AtomicVec::new();
+        let v: AtomicList<i32> = AtomicList::new();
         assert!(v.is_empty());
         assert_eq!(v.len(), 0);
     }
 
     #[test]
     fn push_and_pop_single() {
-        let v = AtomicVec::new();
+        let v = AtomicList::new();
         v.push(10);
         assert_eq!(v.len(), 1);
         assert_eq!(v.pop(), Some(10));
@@ -63,7 +63,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn fifo_order() {
-        let v = AtomicVec::new();
+        let v = AtomicList::new();
         v.push(1);
         v.push(2);
         v.push(3);
@@ -75,7 +75,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn clone_and_refcount() {
-        let v = AtomicVec::new();
+        let v = AtomicList::new();
         let c1 = v.clone();
         let c2 = v.clone();
         assert_eq!(v.len(), 0);
@@ -89,7 +89,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn multithreaded_push() {
-        let v = AtomicVec::new();
+        let v = AtomicList::new();
         const N: usize = 8;
         const PER_THREAD: usize = 100;
 
@@ -113,7 +113,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn multithreaded_pop() {
-        let v = AtomicVec::new();
+        let v = AtomicList::new();
         const N: usize = 4;
         const PER_THREAD: usize = 50;
 
@@ -152,7 +152,7 @@ mod tests_atomic_vec {
 
     #[test]
     fn stress_push_pop_mixed() {
-        let v = AtomicVec::new();
+        let v = AtomicList::new();
         const THREADS: usize = 6;
         const OPS: usize = 200;
 

@@ -1,252 +1,223 @@
-use crate::core::smutex::SMutex;
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::ptr::null_mut;
-use std::sync::atomic;
+use crate::mutex::Mutex;
+use crossbeam_utils::CachePadded;
+use std::fmt;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::{fmt, ptr};
 
-const AVAILABLE: bool = true;
-const UPDATING: bool = false;
+/// Default initial capacity
+const DEFAULT_CAP: usize = 16;
 
-/// Atomic Vec operations lock free
-struct AtomicInner<T> {
-    /// The head of the queue.
-    head: AtomicPtr<Item<T>>,
-
-    /// The tail of the queue.
-    tail: AtomicPtr<Item<T>>,
-
-    /// a temp tail
-    t_tail: AtomicPtr<Item<T>>,
-
-    /// numbers of items in the vec
-    len: AtomicUsize,
-
-    /// cloned ref
-    ref_count: AtomicUsize,
-
-    /// vec state
-    state: SMutex,
-}
-
+/// Thread-safe Vec, clonable
 #[repr(transparent)]
 pub struct AtomicVec<T> {
-    ptr: *const AtomicInner<T>,
+    ptr: *const InnerVec<T>,
 }
 
-unsafe impl<T: Send> Send for AtomicVec<T> {}
-unsafe impl<T: Send> Sync for AtomicVec<T> {}
+struct InnerVec<T> {
+    buf: AtomicPtr<MaybeUninit<T>>,
+    read: CachePadded<AtomicUsize>,
+    write: CachePadded<AtomicUsize>,
+    actual_cap: AtomicUsize,
+    mutex: Mutex,
+    ref_count: AtomicUsize,
+}
 
-impl<T> UnwindSafe for AtomicVec<T> {}
-impl<T> RefUnwindSafe for AtomicVec<T> {}
+// Safety
+unsafe impl<T> Send for AtomicVec<T> {}
+unsafe impl<T> Sync for AtomicVec<T> {}
 
 impl<T> AtomicVec<T> {
     pub fn new() -> Self {
-        let ptr = Box::into_raw(Box::new(AtomicInner {
-            head: AtomicPtr::new(null_mut()),
-            tail: AtomicPtr::new(null_mut()),
-            t_tail: AtomicPtr::new(null_mut()),
-            len: AtomicUsize::new(0),
-            ref_count: AtomicUsize::new(1),
-            state: SMutex::new(),
-        }));
+        Self::with_capacity(DEFAULT_CAP)
+    }
 
-        if ptr.is_null() {
-            panic!("Happened an invalid allocation for AtomicVec");
-        }
-
+    pub fn with_capacity(cap: usize) -> Self {
+        let inner = Box::new(InnerVec::new(cap.max(1)));
+        let ptr = Box::into_raw(inner);
         Self { ptr }
     }
 
     #[inline(always)]
-    fn inner(&self) -> &AtomicInner<T> {
+    fn inner(&self) -> &InnerVec<T> {
         unsafe { &*self.ptr }
     }
 
-    pub fn push(&self, val: T) {
-        let item = Item::new(val);
-
-        if self.is_busy() {
-            if self
-                .inner()
-                .t_tail
-                .compare_exchange(null_mut(), item, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
-            }
-        }
-
-        self.lock();
-        self.update_tail(item);
-        self.release();
+    pub fn len(&self) -> usize {
+        let inner = self.inner();
+        let r = inner.read.load(Ordering::Acquire);
+        let w = inner.write.load(Ordering::Acquire);
+        let cap = inner.actual_cap.load(Ordering::Acquire);
+        (w + cap - r) % cap
     }
 
-    #[inline]
-    fn update_tail(&self, item: *mut Item<T>) {
-        let tail = self.inner().tail.load(Ordering::Acquire);
-        if !tail.is_null() {
-            unsafe {
-                (*tail).next.store(item, Ordering::Release);
-            }
+    pub fn is_empty(&self) -> bool {
+        let inner = self.inner();
+        inner.read.load(Ordering::Acquire) == inner.write.load(Ordering::Acquire)
+    }
+
+    pub fn push(&self, value: T) {
+        let inner = self.inner();
+        inner.mutex.lock_exclusive();
+
+        let cap = inner.actual_cap.load(Ordering::Acquire);
+        let r = inner.read.load(Ordering::Acquire);
+        let w = inner.write.load(Ordering::Acquire);
+        let next_w = (w + 1) % cap;
+
+        if next_w == r {
+            // buffer full, need a resize
+            inner.resize(cap * 2);
         }
-        self.inner().tail.store(item, Ordering::Release);
 
-        // if the head is pointing to null we need to link it.
-        let _ = self.inner().head.compare_exchange(
-            null_mut(),
-            item,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
+        let cap = inner.actual_cap.load(Ordering::Acquire);
+        let w = inner.write.load(Ordering::Acquire);
+        let buf_ptr = inner.buf.load(Ordering::Acquire);
 
-        self.inner().len.fetch_add(1, Ordering::Relaxed);
+        unsafe {
+            buf_ptr.add(w).write(MaybeUninit::new(value));
+        }
+
+        inner.write.store((w + 1) % cap, Ordering::Release);
+        inner.mutex.unlock_exclusive();
     }
 
     pub fn pop(&self) -> Option<T> {
         let inner = self.inner();
+        inner.mutex.lock_exclusive();
 
-        self.lock();
+        let r = inner.read.load(Ordering::Acquire);
+        let w = inner.write.load(Ordering::Acquire);
 
-        let head = inner.head.load(Ordering::Acquire);
-
-        if head.is_null() {
-            self.release();
+        if r == w {
+            inner.mutex.unlock_exclusive();
             return None;
         }
 
-        let next_block = unsafe { (&*head).next.load(Ordering::Acquire) };
-        inner.head.store(next_block, Ordering::Release);
+        let cap = inner.actual_cap.load(Ordering::Acquire);
+        let buf_ptr = inner.buf.load(Ordering::Acquire);
 
-        let tail = inner.tail.load(Ordering::Acquire);
-        if head == tail {
-            // set the tail to nullptr if tail and head are pointing to the same block
-            let _ =
-                inner
-                    .tail
-                    .compare_exchange(tail, null_mut(), Ordering::Release, Ordering::Relaxed);
-        }
+        let value = unsafe { buf_ptr.add(r).read().assume_init() };
+        inner.read.store((r + 1) % cap, Ordering::Release);
 
-        self.release();
-
-        let value = unsafe { ManuallyDrop::into_inner(ptr::read(&(*head).value)) };
-        unsafe { drop(Box::from_raw(head)) };
-
-        inner.len.fetch_sub(1, Ordering::Relaxed);
-
+        inner.mutex.unlock_exclusive();
         Some(value)
     }
 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner().len.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub fn is_busy(&self) -> bool {
-        self.inner().state.is_locked()
-    }
-
-    #[inline]
-    pub fn lock(&self) {
-        self.inner().state.raw_lock();
-    }
-
-    #[inline]
-    pub fn release(&self) {
-        let item = self.inner().t_tail.swap(null_mut(), Ordering::Acquire);
-
-        if !item.is_null() {
-            self.update_tail(item);
+    pub fn get(&self, index: usize) -> Option<T>
+    where
+        T: Copy,
+    {
+        let inner = self.inner();
+        if index >= self.len() {
+            return None;
         }
 
-        self.inner().state.raw_unlock();
+        inner.mutex.lock_shared();
+        let cap = inner.actual_cap.load(Ordering::Acquire);
+        let r = inner.read.load(Ordering::Acquire);
+        let buf_ptr = inner.buf.load(Ordering::Acquire);
+
+        let value = unsafe { buf_ptr.add((r + index) % cap).read().assume_init() };
+        inner.mutex.unlock_shared();
+        Some(value)
     }
-}
 
-impl<T> AtomicVec<T> {
-    /// Drain all elements from the queue in O(1) critical section and return an iterator
-    /// over owned elements. The internal lock is only held to detach the list; iteration
-    /// happens without holding the lock.
-    pub fn drain(&self) -> Option<Drain<T>> {
-        // Acquire exclusive access to detach the list
-        self.lock();
+    pub fn as_slice(&self) -> Vec<T>
+    where
+        T: Copy,
+    {
+        let inner = self.inner();
+        inner.mutex.lock_shared();
 
-        // If there is a pending t_tail (queued while busy), attach it to the real tail so
-        // that it becomes visible before we detach the list. This also adjusts len.
-        let pending = self.inner().t_tail.swap(null_mut(), Ordering::Acquire);
-        if !pending.is_null() {
-            self.update_tail(pending);
-        }
+        let r = inner.read.load(Ordering::Acquire);
+        let w = inner.write.load(Ordering::Acquire);
+        let cap = inner.actual_cap.load(Ordering::Acquire);
+        let len = (w + cap - r) % cap;
 
-        // Detach the whole list atomically
-        let head = self.inner().head.swap(null_mut(), Ordering::Acquire);
-        self.inner().tail.store(null_mut(), Ordering::Release);
-        // Reset length to 0 (we are taking ownership of all nodes)
-        self.inner().len.store(0, Ordering::Relaxed);
+        let buf_ptr = inner.buf.load(Ordering::Acquire);
+        let mut v = Vec::with_capacity(len);
 
-        // Release the internal lock
-        self.release();
-
-        if head.is_null() {
-            None
+        if r < w {
+            for i in r..w {
+                let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
+                v.push(*item);
+            }
         } else {
-            Some(Drain { current: head })
+            // wrap-around
+            for i in r..cap {
+                let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
+                v.push(*item);
+            }
+            for i in 0..w {
+                let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
+                v.push(*item);
+            }
+        }
+
+        inner.mutex.unlock_shared();
+        v
+    }
+}
+
+impl<T> InnerVec<T> {
+    fn new(cap: usize) -> Self {
+        Self {
+            buf: AtomicPtr::new(Self::alloc_buffer(cap)),
+            read: CachePadded::new(AtomicUsize::new(0)),
+            write: CachePadded::new(AtomicUsize::new(0)),
+            actual_cap: AtomicUsize::new(cap),
+            mutex: Mutex::new(),
+            ref_count: AtomicUsize::new(1),
         }
     }
 
-    /// NOTE: The previous to_vec implementation attempted to call pop() while holding the
-    /// internal lock, which could deadlock. Prefer using `drain()` and collecting.
-    pub fn to_vec(&self) -> Vec<T> {
-        match self.drain() {
-            Some(iter) => iter.collect(),
-            None => Vec::new(),
+    fn resize(&self, new_cap: usize) {
+        let old_cap = self.actual_cap.load(Ordering::Acquire);
+        let r = self.read.load(Ordering::Acquire);
+        let w = self.write.load(Ordering::Acquire);
+
+        let old_buf = self.buf.load(Ordering::Acquire);
+        let new_buf = Self::alloc_buffer(new_cap);
+
+        let len = (w + old_cap - r) % old_cap;
+
+        unsafe {
+            if r < w {
+                std::ptr::copy_nonoverlapping(old_buf.add(r), new_buf, len);
+            } else if len > 0 {
+                let first = old_cap - r;
+                std::ptr::copy_nonoverlapping(old_buf.add(r), new_buf, first);
+                std::ptr::copy_nonoverlapping(old_buf, new_buf.add(first), w);
+            }
+
+            let old_layout = std::alloc::Layout::array::<MaybeUninit<T>>(old_cap).unwrap();
+            std::alloc::dealloc(old_buf.cast::<u8>(), old_layout);
+        }
+
+        self.buf.store(new_buf, Ordering::Release);
+        self.read.store(0, Ordering::Release);
+        self.write.store(len, Ordering::Release);
+        self.actual_cap.store(new_cap, Ordering::Release);
+    }
+
+    fn alloc_buffer(cap: usize) -> *mut MaybeUninit<T> {
+        let layout = std::alloc::Layout::array::<MaybeUninit<T>>(cap).unwrap();
+        unsafe {
+            let ptr = std::alloc::alloc(layout) as *mut MaybeUninit<T>;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            ptr
         }
     }
 }
 
-/// A block in a linked list.
-struct Item<T> {
-    /// The value.
-    value: ManuallyDrop<T>,
-
-    /// The next block in the linked list.
-    next: AtomicPtr<Item<T>>,
-}
-
-impl<T> Item<T> {
-    fn new<'a>(val: T) -> *mut Item<T> {
-        Box::into_raw(Box::new(Item {
-            value: ManuallyDrop::new(val),
-            next: AtomicPtr::new(null_mut()),
-        }))
-    }
-}
-
-impl<T> From<Vec<T>> for AtomicVec<T> {
-    fn from(vec: Vec<T>) -> Self {
-        let atomic_vec = Self::new();
-        for v in vec {
-            atomic_vec.push(v);
-        }
-        atomic_vec
-    }
-}
-
-impl<T: Clone> From<&[T]> for AtomicVec<T> {
-    fn from(slice: &[T]) -> Self {
-        let atomic_vec = Self::new();
-        for v in slice {
-            atomic_vec.push(v.clone());
-        }
-        atomic_vec
+impl<T: fmt::Debug> fmt::Debug for AtomicVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AtomicVec")
+            .field("type", &std::any::type_name::<T>())
+            .field("len", &self.len())
+            .finish()
     }
 }
 
@@ -259,169 +230,47 @@ impl<T> Clone for AtomicVec<T> {
 
 impl<T> Drop for AtomicVec<T> {
     fn drop(&mut self) {
-        if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            atomic::fence(Ordering::Acquire);
+        // decrement the reference counter and check if we were the last reference
+        let prev = unsafe { (&*self.ptr).ref_count.fetch_sub(1, Ordering::AcqRel) };
+        if prev != 1 {
+            // not the last reference: we are not responsible for full deallocation
+            return;
+        }
 
-            let ptr = self.ptr as *mut AtomicInner<T>;
+        // we were the last reference: take ownership and destroy everything
+        unsafe {
+            // recover the Box to safely dismantle it (avoids use-after-free)
+            let boxed: Box<InnerVec<T>> = Box::from_raw(self.ptr as *mut InnerVec<T>);
 
-            unsafe {
-                // Prima: estrai la head e la t_tail, così non perdi nodi pendenti.
-                let head = (*ptr).head.swap(null_mut(), Ordering::Acquire);
-                let pending = (*ptr).t_tail.swap(null_mut(), Ordering::Acquire);
+            let r = boxed.read.load(Ordering::Acquire);
+            let w = boxed.write.load(Ordering::Acquire);
+            let cap = boxed.actual_cap.load(Ordering::Acquire);
+            let buf_ptr = boxed.buf.load(Ordering::Acquire);
 
-                // 1) Free head chain
-                let mut cur = head;
-                while !cur.is_null() {
-                    let next = (*cur).next.load(Ordering::Acquire);
-                    // Se il valore è ManuallyDrop, facciamo il drop corretto.
-                    ManuallyDrop::drop(&mut (*cur).value);
-                    drop(Box::from_raw(cur));
-                    cur = next;
+            // number of actual elements (in [0, cap-1])
+            let len = (w + cap - r) % cap;
+
+            // if T requires Drop, call drop_in_place only on valid elements
+            if std::mem::needs_drop::<T>() && len > 0 {
+                for i in 0..len {
+                    let idx = (r + i) % cap;
+                    std::ptr::drop_in_place(buf_ptr.add(idx).cast::<T>());
                 }
-
-                // 2) Free pending chain (t_tail) se diverso da head
-                if !pending.is_null() && pending != head {
-                    let mut cur2 = pending;
-                    while !cur2.is_null() {
-                        let next2 = (*cur2).next.load(Ordering::Acquire);
-                        ManuallyDrop::drop(&mut (*cur2).value);
-                        drop(Box::from_raw(cur2));
-                        cur2 = next2;
-                    }
-                }
-
-                // Infine dealloca la struttura AtomicInner in sè
-                drop(Box::from_raw(ptr));
             }
+
+            // deallocate the raw buffer
+            let layout = std::alloc::Layout::array::<MaybeUninit<T>>(cap).unwrap();
+            std::alloc::dealloc(buf_ptr.cast::<u8>(), layout);
         }
     }
 }
 
-pub struct IntoIter<T> {
-    current: *mut Item<T>,
-}
-
-impl<T> IntoIterator for AtomicVec<T> {
-    type Item = T;
-    type IntoIter = IntoIter<T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        let head = self.inner().head.load(Ordering::Acquire);
-        std::mem::forget(self);
-        IntoIter { current: head }
+impl<T> FromIterator<T> for AtomicVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let v = AtomicVec::new();
+        for item in iter {
+            v.push(item);
+        }
+        v
     }
 }
-
-impl<T> Iterator for IntoIter<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current.is_null() {
-            return None;
-        }
-
-        unsafe {
-            let node = self.current;
-            let next = (*node).next.load(Ordering::Acquire);
-            self.current = next;
-
-            let val = ManuallyDrop::into_inner(ptr::read(&(*node).value));
-            drop(Box::from_raw(node));
-
-            Some(val)
-        }
-    }
-}
-
-impl<T> Drop for IntoIter<T> {
-    fn drop(&mut self) {
-        unsafe {
-            while !self.current.is_null() {
-                let node = self.current;
-                let next = (*node).next.load(Ordering::Acquire);
-                ManuallyDrop::drop(&mut (*node).value);
-                drop(Box::from_raw(node));
-                self.current = next;
-            }
-        }
-    }
-}
-
-/// Iterator returned by AtomicVec::drain(); owns a detached list
-pub struct Drain<T> {
-    current: *mut Item<T>,
-}
-
-impl<T> Iterator for Drain<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current.is_null() {
-            return None;
-        }
-        unsafe {
-            let node = self.current;
-            let next = (*node).next.load(Ordering::Acquire);
-            self.current = next;
-            let val = ManuallyDrop::into_inner(ptr::read(&(*node).value));
-            drop(Box::from_raw(node));
-            Some(val)
-        }
-    }
-}
-
-impl<T> Drop for Drain<T> {
-    fn drop(&mut self) {
-        unsafe {
-            while !self.current.is_null() {
-                let node = self.current;
-                let next = (*node).next.load(Ordering::Acquire);
-                ManuallyDrop::drop(&mut (*node).value);
-                drop(Box::from_raw(node));
-                self.current = next;
-            }
-        }
-    }
-}
-
-pub struct Iter<'a, T> {
-    current: *mut Item<T>,
-    marker: PhantomData<&'a T>,
-}
-
-impl<T> AtomicVec<T> {
-    pub fn iter(&self) -> Iter<'_, T> {
-        let head = self.inner().head.load(Ordering::Acquire);
-        Iter {
-            current: head,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current.is_null() {
-            return None;
-        }
-
-        unsafe {
-            let node = &*self.current;
-            self.current = node.next.load(Ordering::Acquire);
-            Some(&*node.value)
-        }
-    }
-}
-
-impl<T> fmt::Debug for AtomicVec<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AtomicVec")
-            .field("type", &std::any::type_name::<T>())
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-

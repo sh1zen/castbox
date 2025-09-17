@@ -5,4 +5,4 @@ pub(crate) mod smutex;
 mod splcell;
 pub(crate) mod thread;
 
-pub use splcell::{SpinLockCell, SpinLockGuard};
+pub use splcell::{SpinLockCell, ExclusiveGuard, SharedGuard};

@@ -1,6 +1,7 @@
 use crate::collections::AtomicVec;
 use crate::core::scondvar::SCondVar;
 use crate::core::smutex::SMutex;
+use std::sync::atomic;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct MpmcInner<T> {
@@ -22,12 +23,17 @@ unsafe impl<T: Sync> Sync for Mpmc<T> {}
 impl<T> Mpmc<T> {
     /// create a new unbounded channel
     pub fn new() -> Mpmc<T> {
+        Self::bounded(0)
+    }
+
+    /// create a new bounded channel
+    pub fn bounded(n: usize) -> Mpmc<T> {
         let ptr = Box::into_raw(Box::new(MpmcInner {
-            buffer: AtomicVec::new(),
+            buffer: AtomicVec::with_capacity(n),
             mutex: SMutex::new(),
             condvar: SCondVar::new(),
             ref_count: AtomicUsize::new(1),
-            bounded: 0,
+            bounded: n,
             closed: AtomicBool::new(false),
         }));
 
@@ -36,13 +42,6 @@ impl<T> Mpmc<T> {
         }
 
         Self { ptr }
-    }
-
-    /// create a new bounded channel
-    pub fn bounded(n: usize) -> Mpmc<T> {
-        let c = Self::new();
-        c.inner_mut().bounded = n;
-        c
     }
 
     #[inline(always)]
@@ -121,9 +120,11 @@ impl<T> Clone for Mpmc<T> {
 impl<T> Drop for Mpmc<T> {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            std::sync::atomic::fence(Ordering::Acquire);
+            atomic::fence(Ordering::Acquire);
             let ptr = self.ptr as *mut MpmcInner<T>;
-            unsafe { drop(Box::from_raw(ptr)) };
+            if !ptr.is_null() {
+                unsafe { drop(Box::from_raw(ptr)) };
+            }
         }
     }
 }
