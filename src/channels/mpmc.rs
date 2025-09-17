@@ -1,4 +1,4 @@
-use crate::collections::AtomicVec;
+use crate::atomic::AtomicVec;
 use crate::core::scondvar::SCondVar;
 use crate::core::smutex::SMutex;
 use std::sync::atomic;

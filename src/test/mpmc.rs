@@ -1,6 +1,6 @@
 mod tests_mpmc {
     use crate::channels::mpmc::Mpmc;
-    use crate::collections::AtomicList;
+    use crate::atomic::AtomicList;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;

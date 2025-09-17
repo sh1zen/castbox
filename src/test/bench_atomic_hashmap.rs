@@ -1,7 +1,7 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
-use crate::collections::AtomicHashMap;
+use crate::atomic::AtomicHashMap;
 
 fn benchmark_concurrent_rw(
     n_threads: usize,

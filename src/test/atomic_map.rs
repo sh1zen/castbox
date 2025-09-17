@@ -1,7 +1,7 @@
 mod tests_atomic_hashmap {
     use std::sync::Arc;
     use std::thread;
-    use crate::collections::AtomicHashMap;
+    use crate::atomic::AtomicHashMap;
 
     #[test]
     fn stress_test() {
@@ -126,7 +126,7 @@ mod tests_atomic_hashmap {
 
     #[test]
     fn iterates_all_items() {
-        let map = AtomicHashMap::with_capacity(8);
+        let map = AtomicHashMap::with_shard_size(8);
         for i in 0..10 {
             map.insert(i, i * 10);
         }

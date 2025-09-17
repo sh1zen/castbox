@@ -2,7 +2,7 @@ mod tests_atomic_chain {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use crate::collections::AtomicChain;
+    use crate::atomic::AtomicChain;
 
     #[test]
     fn new_is_empty() {

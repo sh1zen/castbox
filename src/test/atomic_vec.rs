@@ -3,7 +3,7 @@ mod tests_atomic_vec {
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
-    use crate::collections::AtomicVec;
+    use crate::atomic::AtomicVec;
 
     #[test]
     fn stress_test() {

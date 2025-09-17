@@ -3,7 +3,7 @@ mod tests_atomic_list {
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
-    use crate::collections::AtomicList;
+    use crate::atomic::AtomicList;
 
     #[test]
     fn stress_test() {

@@ -231,36 +231,33 @@ impl<T> Clone for AtomicVec<T> {
 impl<T> Drop for AtomicVec<T> {
     fn drop(&mut self) {
         // decrement the reference counter and check if we were the last reference
-        let prev = unsafe { (&*self.ptr).ref_count.fetch_sub(1, Ordering::AcqRel) };
-        if prev != 1 {
-            // not the last reference: we are not responsible for full deallocation
-            return;
-        }
+        if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
 
-        // we were the last reference: take ownership and destroy everything
-        unsafe {
-            // recover the Box to safely dismantle it (avoids use-after-free)
-            let boxed: Box<InnerVec<T>> = Box::from_raw(self.ptr as *mut InnerVec<T>);
+            // we were the last reference: take ownership and destroy everything
+            unsafe {
+                // recover the Box to safely dismantle it (avoids use-after-free)
+                let boxed: Box<InnerVec<T>> = Box::from_raw(self.ptr as *mut InnerVec<T>);
 
-            let r = boxed.read.load(Ordering::Acquire);
-            let w = boxed.write.load(Ordering::Acquire);
-            let cap = boxed.actual_cap.load(Ordering::Acquire);
-            let buf_ptr = boxed.buf.load(Ordering::Acquire);
+                let r = boxed.read.load(Ordering::Acquire);
+                let w = boxed.write.load(Ordering::Acquire);
+                let cap = boxed.actual_cap.load(Ordering::Acquire);
+                let buf_ptr = boxed.buf.load(Ordering::Acquire);
 
-            // number of actual elements (in [0, cap-1])
-            let len = (w + cap - r) % cap;
+                // number of actual elements (in [0, cap-1])
+                let len = (w + cap - r) % cap;
 
-            // if T requires Drop, call drop_in_place only on valid elements
-            if std::mem::needs_drop::<T>() && len > 0 {
-                for i in 0..len {
-                    let idx = (r + i) % cap;
-                    std::ptr::drop_in_place(buf_ptr.add(idx).cast::<T>());
+                // if T requires Drop, call drop_in_place only on valid elements
+                if std::mem::needs_drop::<T>() && len > 0 {
+                    for i in 0..len {
+                        let idx = (r + i) % cap;
+                        std::ptr::drop_in_place(buf_ptr.add(idx).cast::<T>());
+                    }
                 }
-            }
 
-            // deallocate the raw buffer
-            let layout = std::alloc::Layout::array::<MaybeUninit<T>>(cap).unwrap();
-            std::alloc::dealloc(buf_ptr.cast::<u8>(), layout);
+                // deallocate the raw buffer
+                let layout = std::alloc::Layout::array::<MaybeUninit<T>>(cap).unwrap();
+                std::alloc::dealloc(buf_ptr.cast::<u8>(), layout);
+            }
         }
     }
 }
