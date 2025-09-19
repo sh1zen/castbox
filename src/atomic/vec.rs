@@ -17,19 +17,16 @@ pub struct AtomicVec<T> {
 }
 
 struct InnerVec<T> {
-    // buffer pointer (interior mutability: modificato solo sotto lock_exclusive,
-    // letto sotto lock_shared)
-    buf: UnsafeCell<*mut MaybeUninit<T>>,
-
-    // indices and capacity (interior mutability)
-    read: CachePadded<UnsafeCell<usize>>,
-    write: CachePadded<UnsafeCell<usize>>,
-    actual_cap: CachePadded<UnsafeCell<usize>>,
+    // padded fields for better cache isolation
+    buf: CachePadded<UnsafeCell<*mut MaybeUninit<T>>>,
+    head: CachePadded<UnsafeCell<usize>>,
+    len: CachePadded<UnsafeCell<usize>>,
+    cap: CachePadded<UnsafeCell<usize>>,
 
     // reader/writer mutex: lock_shared / lock_exclusive
     mutex: Mutex,
 
-    // reference count for clone/drop; padded to avoid false sharing
+    // reference count for clone/drop
     ref_count: CachePadded<AtomicUsize>,
 }
 
@@ -44,7 +41,7 @@ impl<T> AtomicVec<T> {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        let inner = Box::new(InnerVec::new(cap.max(2)));
+        let inner = Box::new(InnerVec::new(cap.max(1)));
         let ptr = Box::into_raw(inner);
         Self {
             ptr: CachePadded::new(ptr),
@@ -56,7 +53,6 @@ impl<T> AtomicVec<T> {
         let vec = Self::with_capacity(cap);
         let inner = vec.inner();
 
-        // esclusivo perché modifichiamo il buffer e gli indici
         inner.mutex.lock_exclusive();
         let buf_ptr = unsafe { *inner.buf.get() };
         for i in 0..cap {
@@ -64,9 +60,9 @@ impl<T> AtomicVec<T> {
                 buf_ptr.add(i).write(MaybeUninit::new(initializer()));
             }
         }
-        // write/read: dopo popolazione - consideriamo il buffer "pieno"
-        inner.set_read(0);
-        inner.set_write(cap % inner.get_cap()); // se cap==actual_cap allora cap%cap == 0, ma semanticamente va bene
+        inner.set_head(0);
+        inner.set_len(cap);
+        inner.set_cap(cap);
         inner.mutex.unlock_exclusive();
 
         vec
@@ -81,12 +77,9 @@ impl<T> AtomicVec<T> {
     pub fn len(&self) -> usize {
         let inner = self.inner();
         inner.mutex.lock_shared();
-        let r = inner.get_read();
-        let w = inner.get_write();
-        let cap = inner.get_cap();
-        let len = (w + cap - r) % cap;
+        let l = inner.get_len();
         inner.mutex.unlock_shared();
-        len
+        l
     }
 
     #[inline(always)]
@@ -103,52 +96,59 @@ impl<T> AtomicVec<T> {
         self.len() == 0
     }
 
-    /// push: esclusivo
+    /// push: esclusivo. Semantica: push_back (aggiunge alla fine)
     pub fn push(&self, value: T) {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
 
-        let cap = inner.get_cap();
-        let r = inner.get_read();
-        let w = inner.get_write();
-        let next_w = (w + 1) % cap;
+        let mut cap = inner.get_cap();
+        let mut len = inner.get_len();
+        let head = inner.get_head();
 
-        if next_w == r {
+        if len == cap {
             // buffer full -> resize (manteniamo il lock esclusivo durante la resize)
             inner.resize_internal(cap * 2);
+            cap = inner.get_cap();
+            len = inner.get_len();
         }
 
-        // r/w/cap possono essere cambiati dalla resize: rileggiamo gli indici
-        let cap = inner.get_cap();
-        let w = inner.get_write();
         let buf_ptr = unsafe { *inner.buf.get() };
 
-        unsafe {
-            buf_ptr.add(w).write(MaybeUninit::new(value));
-        }
+        let write_pos = if len == 0 { 0 } else { (head + len) % cap };
 
-        inner.set_write((w + 1) % cap);
+        unsafe {
+            buf_ptr.add(write_pos).write(MaybeUninit::new(value));
+        }
+        inner.set_len(len + 1);
+
         inner.mutex.unlock_exclusive();
     }
 
-    /// pop: esclusivo
+    /// pop: esclusivo. Semantica: pop_front (rimuove il primo elemento)
     pub fn pop(&self) -> Option<T> {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
 
-        let r = inner.get_read();
-        let w = inner.get_write();
-
-        if r == w {
+        let len = inner.get_len();
+        if len == 0 {
             inner.mutex.unlock_exclusive();
             return None;
         }
 
+        let head = inner.get_head();
         let cap = inner.get_cap();
-        let buf_ptr = unsafe { *inner.buf.get() };
+        let buf_ptr = inner.get_buf();
 
-        let value = unsafe { buf_ptr.add(r).read().assume_init() };
-        inner.set_read((r + 1) % cap);
+        let value = unsafe { buf_ptr.add(head).read().assume_init() };
+
+        if len == 1 {
+            // now empty: reset head to 0 for canonical state
+            inner.set_head(0);
+            inner.set_len(0);
+        } else {
+            inner.set_head((head + 1) % cap);
+            inner.set_len(len - 1);
+        }
 
         inner.mutex.unlock_exclusive();
         Some(value)
@@ -162,15 +162,16 @@ impl<T> AtomicVec<T> {
         let inner = self.inner();
         inner.mutex.lock_shared();
 
-        let r = inner.get_read();
+        let head = inner.get_head();
+        let len = inner.get_len();
         let cap = inner.get_cap();
 
-        if index >= cap {
+        if index >= len {
             inner.mutex.unlock_shared();
             return None;
         }
 
-        let pos = (r + index) % cap;
+        let pos = (head + index) % cap;
         let buf_ptr = unsafe { *inner.buf.get() };
 
         let value = unsafe { (&*buf_ptr.add(pos)).assume_init_ref() };
@@ -181,17 +182,63 @@ impl<T> AtomicVec<T> {
     }
 
     /// resize pubblica: acquisisce lock esclusivo e chiama la funzione di resize interna
-    pub fn resize(&self, new_len: usize) {
+    pub fn resize(&self, new_cap: usize) -> usize {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
-        inner.resize_internal(new_len);
+        inner.resize_internal(new_cap);
         inner.mutex.unlock_exclusive();
+        new_cap
+    }
+
+    // Simplified reset_with: no RAII guard, less panic-safety (user requested simplification)
+    pub fn reset_with(&self, new_cap: usize, mut initializer: impl FnMut() -> T) -> usize {
+        let inner = self.inner();
+        inner.mutex.lock_exclusive();
+
+        let old_head = inner.get_head();
+        let old_len = inner.get_len();
+        let old_cap = inner.get_cap();
+        let old_buf = inner.get_buf();
+
+        // allocate and initialize new buffer. NOTE: if initializer panics here,
+        // the new buffer may leak — this function is intentionally simplified.
+        let new_cap = new_cap.max(1);
+        let new_buf = InnerVec::alloc_buffer(new_cap);
+        for i in 0..new_cap {
+            unsafe {
+                new_buf.add(i).write(MaybeUninit::new(initializer()));
+            }
+        }
+
+        // drop old elements safely
+        if std::mem::needs_drop::<T>() && old_len > 0 {
+            for i in 0..old_len {
+                let idx = (old_head + i) % old_cap;
+                unsafe {
+                    ptr::drop_in_place(old_buf.add(idx).cast::<T>());
+                }
+            }
+        }
+
+        unsafe {
+            let old_layout = std::alloc::Layout::array::<MaybeUninit<T>>(old_cap).unwrap();
+            std::alloc::dealloc(old_buf.cast::<u8>(), old_layout);
+        }
+
+        // commit new buffer: it is fully initialized and contains `new_cap` elements
+        inner.set_buf(new_buf);
+        inner.set_head(0);
+        inner.set_len(new_cap);
+        inner.set_cap(new_cap);
+
+        inner.mutex.unlock_exclusive();
+        new_cap
     }
 }
 
 impl<T> AtomicVec<T> {
     /// as_slice: shared
-    /// as_slice: restituisce una copia del contenuto (shared)
+    /// restituisce una copia del contenuto (shared)
     pub fn as_slice(&self) -> Vec<T>
     where
         T: Clone,
@@ -199,29 +246,18 @@ impl<T> AtomicVec<T> {
         let inner = self.inner();
         inner.mutex.lock_shared();
 
-        let r = inner.get_read();
-        let w = inner.get_write();
+        let head = inner.get_head();
+        let len = inner.get_len();
         let cap = inner.get_cap();
-        let len = (w + cap - r) % cap;
 
         let buf_ptr = inner.get_buf();
         let mut v = Vec::with_capacity(len);
 
         if len > 0 {
-            if r < w {
-                for i in r..w {
-                    let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
-                    v.push(item.clone());
-                }
-            } else {
-                for i in r..cap {
-                    let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
-                    v.push(item.clone());
-                }
-                for i in 0..w {
-                    let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
-                    v.push(item.clone());
-                }
+            for i in 0..len {
+                let pos = (head + i) % cap;
+                let item = unsafe { (&*buf_ptr.add(pos)).assume_init_ref() };
+                v.push(item.clone());
             }
         }
 
@@ -235,34 +271,23 @@ impl<T> AtomicVec<T> {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
 
-        let r = inner.get_read();
-        let w = inner.get_write();
+        let head = inner.get_head();
+        let len = inner.get_len();
         let cap = inner.get_cap();
-        let len = (w + cap - r) % cap;
 
         let buf_ptr = inner.get_buf();
         let mut out = Vec::with_capacity(len);
 
         unsafe {
-            if len > 0 {
-                if r < w {
-                    for i in r..w {
-                        out.push(buf_ptr.add(i).read().assume_init());
-                    }
-                } else {
-                    for i in r..cap {
-                        out.push(buf_ptr.add(i).read().assume_init());
-                    }
-                    for i in 0..w {
-                        out.push(buf_ptr.add(i).read().assume_init());
-                    }
-                }
+            for i in 0..len {
+                let pos = (head + i) % cap;
+                out.push(buf_ptr.add(pos).read().assume_init());
             }
         }
 
         // reset indices: buffer ora considerato vuoto
-        inner.set_read(0);
-        inner.set_write(0);
+        inner.set_head(0);
+        inner.set_len(0);
 
         inner.mutex.unlock_exclusive();
         out
@@ -273,39 +298,39 @@ impl<T> InnerVec<T> {
     fn new(cap: usize) -> Self {
         let buf = Self::alloc_buffer(cap);
         Self {
-            buf: UnsafeCell::new(buf),
-            read: CachePadded::new(UnsafeCell::new(0)),
-            write: CachePadded::new(UnsafeCell::new(0)),
-            actual_cap: CachePadded::new(UnsafeCell::new(cap)),
+            buf: CachePadded::new(UnsafeCell::new(buf)),
+            head: CachePadded::new(UnsafeCell::new(0)),
+            len: CachePadded::new(UnsafeCell::new(0)),
+            cap: CachePadded::new(UnsafeCell::new(cap)),
             mutex: Mutex::new(),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
         }
     }
 
-    // getter/setter per read/write/cap (usare SOLO con lock appropriato)
+    // getter/setter per head/len/cap/buf (usare SOLO con lock appropriato)
     #[inline(always)]
-    fn get_read(&self) -> usize {
-        unsafe { *self.read.get() }
+    fn get_head(&self) -> usize {
+        unsafe { *self.head.get() }
     }
     #[inline(always)]
-    fn set_read(&self, v: usize) {
-        unsafe { *self.read.get() = v }
+    fn set_head(&self, v: usize) {
+        unsafe { *self.head.get() = v }
     }
     #[inline(always)]
-    fn get_write(&self) -> usize {
-        unsafe { *self.write.get() }
+    fn get_len(&self) -> usize {
+        unsafe { *self.len.get() }
     }
     #[inline(always)]
-    fn set_write(&self, v: usize) {
-        unsafe { *self.write.get() = v }
+    fn set_len(&self, v: usize) {
+        unsafe { *self.len.get() = v }
     }
     #[inline(always)]
     fn get_cap(&self) -> usize {
-        unsafe { *self.actual_cap.get() }
+        unsafe { *self.cap.get() }
     }
     #[inline(always)]
     fn set_cap(&self, v: usize) {
-        unsafe { *self.actual_cap.get() = v }
+        unsafe { *self.cap.get() = v }
     }
     #[inline(always)]
     fn get_buf(&self) -> *mut MaybeUninit<T> {
@@ -319,30 +344,24 @@ impl<T> InnerVec<T> {
     /// internal resize: assume di avere il lock esclusivo
     fn resize_internal(&self, new_cap: usize) {
         let old_cap = self.get_cap();
+
+        // todo add support to shrinking
         if old_cap >= new_cap {
             return;
         }
 
-        let r = self.get_read();
-        let w = self.get_write();
-
+        let head = self.get_head();
+        let len = self.get_len();
         let old_buf = self.get_buf();
         let new_buf = Self::alloc_buffer(new_cap);
 
-        // numero di elementi validi
-        let len = (w + old_cap - r) % old_cap;
-
         unsafe {
-            if len == 0 {
-                // non c'è nulla da copiare
-            } else if r < w {
-                // blocco contiguo
-                ptr::copy_nonoverlapping(old_buf.add(r), new_buf, len);
-            } else {
-                // wrap-around: copia in due blocchi
-                let first = old_cap - r;
-                ptr::copy_nonoverlapping(old_buf.add(r), new_buf, first);
-                ptr::copy_nonoverlapping(old_buf, new_buf.add(first), w);
+            if len > 0 {
+                for i in 0..len {
+                    let idx = (head + i) % old_cap;
+                    let value = old_buf.add(idx).read().assume_init();
+                    new_buf.add(i).write(MaybeUninit::new(value));
+                }
             }
 
             // dealloc old buffer
@@ -352,8 +371,8 @@ impl<T> InnerVec<T> {
 
         // aggiorniamo pointer e indici
         self.set_buf(new_buf);
-        self.set_read(0);
-        self.set_write(len);
+        self.set_head(0);
+        self.set_len(len);
         self.set_cap(new_cap);
     }
 
@@ -380,39 +399,37 @@ impl<T: fmt::Debug> fmt::Debug for AtomicVec<T> {
 
 impl<T> Clone for AtomicVec<T> {
     fn clone(&self) -> Self {
-        // aggiornamento ref_count (atomic)
-        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
+        // increment refcount
+        let inner = self.inner();
+        inner.ref_count.fetch_add(1, Ordering::Relaxed);
         Self { ptr: self.ptr }
     }
 }
 
 impl<T> Drop for AtomicVec<T> {
     fn drop(&mut self) {
-        // decrement refcount; se arriviamo a zero distruggiamo
-        if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
-            // sincronizza con altre operazioni in corso (se ce ne fossero)
+        let inner = self.inner();
+        if inner.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             std::sync::atomic::fence(Ordering::Acquire);
 
             unsafe {
-                // riprendiamo ownership del Box per deallocare in sicurezza
                 let boxed: Box<InnerVec<T>> = Box::from_raw(*self.ptr as *mut InnerVec<T>);
 
-                let r = boxed.get_read();
-                let w = boxed.get_write();
+                let head = boxed.get_head();
+                let len = boxed.get_len();
                 let cap = boxed.get_cap();
                 let buf_ptr = boxed.get_buf();
 
-                let len = (w + cap - r) % cap;
-
                 if std::mem::needs_drop::<T>() && len > 0 {
                     for i in 0..len {
-                        let idx = (r + i) % cap;
+                        let idx = (head + i) % cap;
                         ptr::drop_in_place(buf_ptr.add(idx).cast::<T>());
                     }
                 }
 
                 let layout = std::alloc::Layout::array::<MaybeUninit<T>>(cap).unwrap();
                 std::alloc::dealloc(buf_ptr.cast::<u8>(), layout);
+                // boxed is dropped here
             }
         }
     }

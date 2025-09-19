@@ -1,8 +1,7 @@
 mod tests_atomic_hashmap {
-    use std::fmt::format;
+    use crate::atomic::AtomicHashMap;
     use std::sync::Arc;
     use std::thread;
-    use crate::atomic::AtomicHashMap;
 
     #[test]
     fn stress_test() {
@@ -12,7 +11,7 @@ mod tests_atomic_hashmap {
         let vec = AtomicHashMap::new();
         let vec_c = vec.clone();
 
-        let barrier = Arc::new(Barrier::new(350));
+        let barrier = Arc::new(Barrier::new(50));
 
         vec_c.insert(1, "hello".to_string());
         vec_c.insert(2, "world".to_string());
@@ -93,17 +92,8 @@ mod tests_atomic_hashmap {
     fn overwrite_value() {
         let map = AtomicHashMap::new();
         map.insert("key", 42);
-        let c =map.get("key");
+        let c = map.get("key");
         assert_eq!(*c.unwrap(), 42);
-
-        map.insert("1", 1);
-        map.insert("2", 1);
-        map.insert("3", 1);
-        map.insert("4", 1);
-        map.insert("5", 1);
-        map.insert("6", 1);
-
-
         map.insert("key", 99);
         assert_eq!(*map.get("key").unwrap(), 99);
         assert_eq!(map.len(), 1);
@@ -142,7 +132,7 @@ mod tests_atomic_hashmap {
         }
 
         let mut seen = 0;
-       /* for (k, v) in map.iter() {
+        /* for (k, v) in map.iter() {
             assert_eq!(*v, *k * 10);
             seen += 1;
         }

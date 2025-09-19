@@ -1,9 +1,9 @@
 mod tests_atomic_vec {
-    use std::sync::{Arc, Barrier};
+    use crate::atomic::AtomicVec;
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Instant;
-    use crate::atomic::AtomicVec;
 
     #[test]
     fn stress_test() {
@@ -158,7 +158,7 @@ mod tests_atomic_vec {
 
         let barrier = Arc::new(Barrier::new(THREADS));
         let total_pushes = Arc::new(AtomicUsize::new(0));
-        let total_pops   = Arc::new(AtomicUsize::new(0));
+        let total_pops = Arc::new(AtomicUsize::new(0));
 
         let mut ths = Vec::new();
         for id in 0..THREADS {
@@ -199,6 +199,19 @@ mod tests_atomic_vec {
 
         let slice = v.as_slice();
         assert_eq!(slice, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_as_vec() {
+        let v = AtomicVec::init_with(2, || 1);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.capacity(), 2);
+        assert_eq!(v.as_vec(), vec![1, 1]);
+
+        let v = AtomicVec::init_with(1, || 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v.capacity(), 1);
+        assert_eq!(v.as_vec(), vec![1]);
     }
 
     #[test]

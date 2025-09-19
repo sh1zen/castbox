@@ -11,9 +11,9 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Number of shards (buckets)
-const NUM_SHARDS: usize = 1;
+const NUM_SHARDS: usize = 4;
 /// Default size of each shard's vector
-const DEFAULT_SHARD_SIZE: usize = 1;
+const DEFAULT_SHARD_SIZE: usize = 128;
 /// Load factor threshold for resizing
 const LOAD_FACTOR_THRESHOLD: f64 = 0.75;
 
@@ -62,9 +62,8 @@ struct Shard<K, V> {
 
 impl<K: Eq + Hash, V> Shard<K, V> {
     fn new(size: usize) -> Self {
-        let slots = AtomicVec::init_with(size, || Box::into_raw(Box::new(Slot::new())));
         Self {
-            slots,
+            slots: AtomicVec::init_with(size, || Box::into_raw(Box::new(Slot::new()))),
             size: AtomicUsize::new(size),
             mutex: Mutex::new(),
         }
@@ -72,8 +71,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
 
     #[inline]
     fn get_slot(&self, index: usize) -> Option<&Slot<K, V>> {
-        let ptr = self.slots.get(index)?;
-        Some(unsafe { &*ptr })
+        Some(unsafe { &*self.slots.get(index)? })
     }
 
     fn insert(&self, slot_idx: usize, key: K, value: V) -> Option<V> {
@@ -235,17 +233,16 @@ impl<K: Eq + Hash, V> Shard<K, V> {
 
         let prev_values = self.slots.as_vec();
 
-        let new_size = old_size * 2;
-        self.slots.resize(new_size);
+        let new_size = self.slots.reset_with(old_size * 2, || Box::into_raw(Box::new(Slot::new())));
 
         // rehash all entries
         for slot in prev_values {
             let old_slot = unsafe { &*slot };
             old_slot.mutex.lock_exclusive();
 
-            let mut cur = old_slot.head.load(Ordering::Acquire);
-            while !cur.is_null() {
-                let entry = unsafe { &(*cur) };
+            let mut cur_entry = old_slot.head.load(Ordering::Acquire);
+            while !cur_entry.is_null() {
+                let entry = unsafe { &(*cur_entry) };
                 let next_entry = entry.next.load(Ordering::Acquire);
 
                 // recompute new slot index
@@ -255,11 +252,13 @@ impl<K: Eq + Hash, V> Shard<K, V> {
 
                 let new_slot = unsafe { &*self.slots.get(new_slot_idx).unwrap() };
 
-                entry.next.store(new_slot.head.load(Ordering::Acquire), Ordering::Release);
+                entry
+                    .next
+                    .store(new_slot.head.load(Ordering::Acquire), Ordering::Release);
 
-                new_slot.head.store(cur, Ordering::Release);
+                new_slot.head.store(cur_entry, Ordering::Release);
 
-                cur = next_entry
+                cur_entry = next_entry
             }
 
             old_slot.mutex.unlock_exclusive();
