@@ -23,7 +23,7 @@ struct InnerMutex {
     /// Futex for writers
     writers_futex: CachePadded<AtomicUsize>,
     /// Reference counter, updated infrequently
-    ref_count: AtomicUsize,
+    ref_count: CachePadded<AtomicUsize>,
 }
 
 #[inline]
@@ -45,7 +45,7 @@ impl InnerMutex {
     fn new() -> Self {
         Self {
             state: CachePadded::new(AtomicUsize::new(0)),
-            ref_count: AtomicUsize::new(1),
+            ref_count: CachePadded::new(AtomicUsize::new(1)),
             readers_futex: CachePadded::new(AtomicUsize::new(0)),
             writers_futex: CachePadded::new(AtomicUsize::new(0)),
         }
@@ -54,7 +54,7 @@ impl InnerMutex {
 
 #[repr(transparent)]
 pub struct Mutex {
-    ptr: *const InnerMutex,
+    ptr: CachePadded<*const InnerMutex>,
 }
 
 unsafe impl Send for Mutex {}
@@ -67,12 +67,14 @@ impl Mutex {
     /// Create a new mutex instance with reference count = 1
     pub fn new() -> Self {
         let ptr = Box::into_raw(Box::new(InnerMutex::new()));
-        Self { ptr }
+        Self {
+            ptr: CachePadded::new(ptr),
+        }
     }
 
     #[inline(always)]
     fn inner(&self) -> &InnerMutex {
-        unsafe { &*self.ptr }
+        unsafe { &**self.ptr }
     }
 
     /// Returns the current reference count.
@@ -289,7 +291,12 @@ impl Mutex {
         if prev_state == (ONE_READER | WRITERS_PARKED) {
             if inner
                 .state
-                .compare_exchange(WRITERS_PARKED, UNLOCKED, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange(
+                    WRITERS_PARKED,
+                    UNLOCKED,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 inner.writers_futex.fetch_add(1, Ordering::Release);
@@ -424,7 +431,7 @@ impl Drop for Mutex {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
-            let ptr = self.ptr as *mut InnerMutex;
+            let ptr = *self.ptr as *mut InnerMutex;
             unsafe { drop(Box::from_raw(ptr)) };
         }
     }

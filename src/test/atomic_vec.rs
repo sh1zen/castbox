@@ -189,4 +189,45 @@ mod tests_atomic_vec {
         assert!(pushes >= pops);
         assert_eq!(v.len(), pushes - pops);
     }
+
+    #[test]
+    fn test_as_slice_basic() {
+        let v = AtomicVec::new();
+        v.push(1);
+        v.push(2);
+        v.push(3);
+
+        let slice = v.as_slice();
+        assert_eq!(slice, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_as_slice_wraparound() {
+        let v = AtomicVec::with_capacity(4);
+
+        // Riempie il buffer fino a forzare il wrap-around
+        v.push(10);
+        v.push(20);
+        v.push(30);
+        v.push(40);
+
+        // Consuma due elementi
+        assert_eq!(v.pop(), Some(10));
+        assert_eq!(v.pop(), Some(20));
+
+        // Ora il read pointer è avanti rispetto al write
+        v.push(50);
+        v.push(60);
+
+        // as_slice deve restituire in ordine logico, non fisico
+        let slice = v.as_slice();
+        assert_eq!(slice, vec![30, 40, 50, 60]);
+    }
+
+    #[test]
+    fn test_as_slice_empty() {
+        let v: AtomicVec<i32> = AtomicVec::new();
+        let slice = v.as_slice();
+        assert!(slice.is_empty());
+    }
 }

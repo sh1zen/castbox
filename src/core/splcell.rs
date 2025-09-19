@@ -16,8 +16,8 @@ const ONE_WRITER: State = !(READERS_PARKED | WRITERS_PARKED);
 pub struct SpinLockCell<T> {
     state: CachePadded<AtomicUsize>,
     /// Reference counter, updated infrequently
-    ref_count: AtomicUsize,
-    val: UnsafeCell<T>,
+    ref_count: CachePadded<AtomicUsize>,
+    val: CachePadded<UnsafeCell<T>>,
 }
 
 #[inline]
@@ -43,8 +43,8 @@ impl<T> SpinLockCell<T> {
     pub fn new(val: T) -> Self {
         Self {
             state: CachePadded::new(AtomicUsize::new(UNLOCKED)),
-            ref_count: AtomicUsize::new(1),
-            val: UnsafeCell::new(val),
+            ref_count: CachePadded::new(AtomicUsize::new(1)),
+            val: CachePadded::new(UnsafeCell::new(val)),
         }
     }
 

@@ -13,7 +13,7 @@ const DEFAULT_CAP: usize = 16;
 /// Thread-safe Vec, clonable
 #[repr(transparent)]
 pub struct AtomicVec<T> {
-    ptr: *const InnerVec<T>,
+    ptr: CachePadded<*const InnerVec<T>>,
 }
 
 struct InnerVec<T> {
@@ -44,9 +44,11 @@ impl<T> AtomicVec<T> {
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        let inner = Box::new(InnerVec::new(cap.max(1)));
+        let inner = Box::new(InnerVec::new(cap.max(2)));
         let ptr = Box::into_raw(inner);
-        Self { ptr }
+        Self {
+            ptr: CachePadded::new(ptr),
+        }
     }
 
     /// init_with: costruisce e popola il buffer — operazione esclusiva
@@ -72,7 +74,7 @@ impl<T> AtomicVec<T> {
 
     #[inline(always)]
     fn inner(&self) -> &InnerVec<T> {
-        unsafe { &*self.ptr }
+        unsafe { &**self.ptr }
     }
 
     #[inline(always)]
@@ -98,11 +100,7 @@ impl<T> AtomicVec<T> {
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner();
-        inner.mutex.lock_shared();
-        let empty = inner.get_read() == inner.get_write();
-        inner.mutex.unlock_shared();
-        empty
+        self.len() == 0
     }
 
     /// push: esclusivo
@@ -182,10 +180,21 @@ impl<T> AtomicVec<T> {
         Some(ret)
     }
 
+    /// resize pubblica: acquisisce lock esclusivo e chiama la funzione di resize interna
+    pub fn resize(&self, new_len: usize) {
+        let inner = self.inner();
+        inner.mutex.lock_exclusive();
+        inner.resize_internal(new_len);
+        inner.mutex.unlock_exclusive();
+    }
+}
+
+impl<T> AtomicVec<T> {
     /// as_slice: shared
+    /// as_slice: restituisce una copia del contenuto (shared)
     pub fn as_slice(&self) -> Vec<T>
     where
-        T: Copy,
+        T: Clone,
     {
         let inner = self.inner();
         inner.mutex.lock_shared();
@@ -195,23 +204,24 @@ impl<T> AtomicVec<T> {
         let cap = inner.get_cap();
         let len = (w + cap - r) % cap;
 
-        let buf_ptr = unsafe { *inner.buf.get() };
+        let buf_ptr = inner.get_buf();
         let mut v = Vec::with_capacity(len);
 
-        if r < w {
-            for i in r..w {
-                let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
-                v.push(*item);
-            }
-        } else {
-            // wrap-around
-            for i in r..cap {
-                let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
-                v.push(*item);
-            }
-            for i in 0..w {
-                let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
-                v.push(*item);
+        if len > 0 {
+            if r < w {
+                for i in r..w {
+                    let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
+                    v.push(item.clone());
+                }
+            } else {
+                for i in r..cap {
+                    let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
+                    v.push(item.clone());
+                }
+                for i in 0..w {
+                    let item = unsafe { (&*buf_ptr.add(i)).assume_init_ref() };
+                    v.push(item.clone());
+                }
             }
         }
 
@@ -219,12 +229,43 @@ impl<T> AtomicVec<T> {
         v
     }
 
-    /// resize pubblica: acquisisce lock esclusivo e chiama la funzione di resize interna
-    pub fn resize(&self, new_len: usize) {
+    /// Consuma i dati correnti e li restituisce come `Vec<T>`.
+    /// Dopo la chiamata, l'AtomicVec risulta vuoto.
+    pub fn as_vec(&self) -> Vec<T> {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
-        inner.resize_internal(new_len);
+
+        let r = inner.get_read();
+        let w = inner.get_write();
+        let cap = inner.get_cap();
+        let len = (w + cap - r) % cap;
+
+        let buf_ptr = inner.get_buf();
+        let mut out = Vec::with_capacity(len);
+
+        unsafe {
+            if len > 0 {
+                if r < w {
+                    for i in r..w {
+                        out.push(buf_ptr.add(i).read().assume_init());
+                    }
+                } else {
+                    for i in r..cap {
+                        out.push(buf_ptr.add(i).read().assume_init());
+                    }
+                    for i in 0..w {
+                        out.push(buf_ptr.add(i).read().assume_init());
+                    }
+                }
+            }
+        }
+
+        // reset indices: buffer ora considerato vuoto
+        inner.set_read(0);
+        inner.set_write(0);
+
         inner.mutex.unlock_exclusive();
+        out
     }
 }
 
@@ -354,7 +395,7 @@ impl<T> Drop for AtomicVec<T> {
 
             unsafe {
                 // riprendiamo ownership del Box per deallocare in sicurezza
-                let boxed: Box<InnerVec<T>> = Box::from_raw(self.ptr as *mut InnerVec<T>);
+                let boxed: Box<InnerVec<T>> = Box::from_raw(*self.ptr as *mut InnerVec<T>);
 
                 let r = boxed.get_read();
                 let w = boxed.get_write();
@@ -366,7 +407,7 @@ impl<T> Drop for AtomicVec<T> {
                 if std::mem::needs_drop::<T>() && len > 0 {
                     for i in 0..len {
                         let idx = (r + i) % cap;
-                        std::ptr::drop_in_place(buf_ptr.add(idx).cast::<T>());
+                        ptr::drop_in_place(buf_ptr.add(idx).cast::<T>());
                     }
                 }
 

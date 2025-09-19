@@ -1,4 +1,5 @@
 mod tests_atomic_hashmap {
+    use std::fmt::format;
     use std::sync::Arc;
     use std::thread;
     use crate::atomic::AtomicHashMap;
@@ -94,6 +95,14 @@ mod tests_atomic_hashmap {
         map.insert("key", 42);
         let c =map.get("key");
         assert_eq!(*c.unwrap(), 42);
+
+        map.insert("1", 1);
+        map.insert("2", 1);
+        map.insert("3", 1);
+        map.insert("4", 1);
+        map.insert("5", 1);
+        map.insert("6", 1);
+
 
         map.insert("key", 99);
         assert_eq!(*map.get("key").unwrap(), 99);

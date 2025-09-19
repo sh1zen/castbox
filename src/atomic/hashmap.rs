@@ -11,9 +11,9 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Number of shards (buckets)
-const NUM_SHARDS: usize = 4;
+const NUM_SHARDS: usize = 1;
 /// Default size of each shard's vector
-const DEFAULT_SHARD_SIZE: usize = 128;
+const DEFAULT_SHARD_SIZE: usize = 1;
 /// Load factor threshold for resizing
 const LOAD_FACTOR_THRESHOLD: f64 = 0.75;
 
@@ -227,43 +227,39 @@ impl<K: Eq + Hash, V> Shard<K, V> {
 
     fn maybe_resize<S: BuildHasher>(&self, hasher: &S) -> bool {
         let old_size = self.size.load(Ordering::Acquire);
-        let count = self.slots.len();
+        let count = self.len();
 
         if (count as f64) < (old_size as f64 * LOAD_FACTOR_THRESHOLD) {
             return false;
         }
 
-        let slice = self.slots.as_slice();
+        let prev_values = self.slots.as_vec();
 
         let new_size = old_size * 2;
         self.slots.resize(new_size);
 
         // rehash all entries
-        for slot in slice {
+        for slot in prev_values {
             let old_slot = unsafe { &*slot };
             old_slot.mutex.lock_exclusive();
 
             let mut cur = old_slot.head.load(Ordering::Acquire);
             while !cur.is_null() {
                 let entry = unsafe { &(*cur) };
-
-                let next = entry.next.load(Ordering::Acquire);
+                let next_entry = entry.next.load(Ordering::Acquire);
 
                 // recompute new slot index
                 let mut h = hasher.build_hasher();
                 entry.key.hash(&mut h);
                 let new_slot_idx = (h.finish() as usize) % new_size;
 
-                let new_slot_ptr = self.slots.get(new_slot_idx).unwrap();
+                let new_slot = unsafe { &*self.slots.get(new_slot_idx).unwrap() };
 
-                let new_slot = unsafe { &*new_slot_ptr };
+                entry.next.store(new_slot.head.load(Ordering::Acquire), Ordering::Release);
 
-                entry
-                    .next
-                    .store(new_slot.head.load(Ordering::Acquire), Ordering::Release);
                 new_slot.head.store(cur, Ordering::Release);
 
-                cur = next;
+                cur = next_entry
             }
 
             old_slot.mutex.unlock_exclusive();
@@ -330,6 +326,7 @@ pub struct AtomicHashMap<K, V, S = RandomState> {
 
 unsafe impl<K: Send, V: Send, S> Send for AtomicHashMap<K, V, S> {}
 unsafe impl<K: Send, V: Send, S> Sync for AtomicHashMap<K, V, S> {}
+
 impl<K, V, S> UnwindSafe for AtomicHashMap<K, V, S> {}
 impl<K, V, S> RefUnwindSafe for AtomicHashMap<K, V, S> {}
 
