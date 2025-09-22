@@ -1,3 +1,4 @@
+use crate::atomic::AtomicVec;
 use crate::mutex::{Backoff, Mutex, WatchGuardRef};
 use std::borrow::Borrow;
 use std::collections::hash_map::DefaultHasher;
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 const BUCKET_AVAILABLE: bool = true;
 const BUCKET_UPDATING: bool = false;
-const DEFAULT_BUCKETS: usize = 256;
+const DEFAULT_BUCKETS: usize = 32;
 
 struct Item<K, V> {
     key: K,
@@ -68,7 +69,7 @@ impl<K, V> Bucket<K, V> {
 }
 
 struct AtomicChainInner<K, V> {
-    buckets: Vec<Bucket<K, V>>,
+    buckets: AtomicVec<Bucket<K, V>>,
     lock: Mutex,
     len: AtomicUsize,
     ref_count: AtomicUsize,
@@ -91,7 +92,7 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
     }
 
     pub fn with_capacity(bucket_count: usize) -> Self {
-        let buckets = (0..bucket_count).map(|_| Bucket::new()).collect();
+        let buckets = AtomicVec::init_with(bucket_count, || Bucket::new());
         let ptr = Box::into_raw(Box::new(AtomicChainInner {
             buckets,
             len: AtomicUsize::new(0),
@@ -258,14 +259,14 @@ impl<K: Eq + Hash, V> AtomicChain<K, V> {
     }
 
     #[inline]
-    fn find_bucket<Q: ?Sized>(&self, key: &Q) -> Option<&Bucket<K, V>>
+    fn find_bucket<Q: ?Sized>(&self, key: &Q) -> Option<WatchGuardRef<'_, Bucket<K, V>>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
         let h = Self::hash(key);
         let bucket_idx = h as usize % self.inner().buckets.len();
-        Some(&self.inner().buckets[bucket_idx])
+        self.inner().buckets.get(bucket_idx)
     }
 
     pub fn len(&self) -> usize {
@@ -287,7 +288,7 @@ impl<K, V> Drop for AtomicChain<K, V> {
         if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
 
-            for bucket in &inner.buckets {
+            while let Some(bucket) = inner.buckets.pop() {
                 let mut cur = bucket.head.load(Ordering::Acquire);
                 while !cur.is_null() {
                     unsafe {
@@ -332,7 +333,7 @@ impl<'a, K: Eq + Hash, V> Iter<'a, K, V> {
 
     fn advance_bucket(&mut self) {
         while self.bucket_idx < self.map.inner().buckets.len() && self.current.is_null() {
-            let bucket = &self.map.inner().buckets[self.bucket_idx];
+            let bucket = &self.map.inner().buckets.get(self.bucket_idx).unwrap();
             self.current = bucket.head.load(Ordering::Acquire);
             if self.current.is_null() {
                 self.bucket_idx += 1;
@@ -354,7 +355,7 @@ impl<'a, K: Eq + Hash, V> Iterator for Iter<'a, K, V> {
             return None;
         }
 
-        let bucket = &self.map.inner().buckets[self.bucket_idx];
+        let bucket = &self.map.inner().buckets.get(self.bucket_idx).unwrap();
         let backoff = Backoff::new();
 
         while bucket.ref_locked.is_locked_exclusive() {

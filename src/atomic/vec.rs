@@ -1,4 +1,4 @@
-use crate::mutex::Mutex;
+use crate::mutex::{Mutex, WatchGuardRef};
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -152,10 +152,7 @@ impl<T> AtomicVec<T> {
     }
 
     /// get: shared. index è relativo al contenuto (0..len-1)
-    pub fn get(&self, index: usize) -> Option<T>
-    where
-        T: Copy,
-    {
+    pub fn get(&self, index: usize) -> Option<WatchGuardRef<'_, T>> {
         let inner = self.inner();
         inner.mutex.lock_shared();
 
@@ -172,10 +169,8 @@ impl<T> AtomicVec<T> {
         let buf_ptr = unsafe { *inner.buf.get() };
 
         let value = unsafe { (&*buf_ptr.add(pos)).assume_init_ref() };
-        let ret = *value;
 
-        inner.mutex.unlock_shared();
-        Some(ret)
+        Some(WatchGuardRef::new(value, inner.mutex.clone()))
     }
 
     /// resize pubblica: acquisisce lock esclusivo e chiama la funzione di resize interna
@@ -309,26 +304,32 @@ impl<T> InnerVec<T> {
     fn get_head(&self) -> usize {
         unsafe { *self.head.get() }
     }
+
     #[inline(always)]
     fn set_head(&self, v: usize) {
         unsafe { *self.head.get() = v }
     }
+
     #[inline(always)]
     fn get_len(&self) -> usize {
         unsafe { *self.len.get() }
     }
+
     #[inline(always)]
     fn set_len(&self, v: usize) {
         unsafe { *self.len.get() = v }
     }
+
     #[inline(always)]
     fn get_cap(&self) -> usize {
         unsafe { *self.cap.get() }
     }
+
     #[inline(always)]
     fn set_cap(&self, v: usize) {
         unsafe { *self.cap.get() = v }
     }
+
     #[inline(always)]
     fn get_buf(&self) -> *mut MaybeUninit<T> {
         unsafe { *self.buf.get() }
@@ -431,6 +432,7 @@ impl<T> Drop for AtomicVec<T> {
         }
     }
 }
+
 
 impl<T> FromIterator<T> for AtomicVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
