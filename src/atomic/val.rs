@@ -1,5 +1,6 @@
 use crate::mutex::{Mutex, WatchGuardMut, WatchGuardRef};
 use std::cell::UnsafeCell;
+use std::mem;
 use std::sync::atomic::{self, AtomicUsize, Ordering};
 
 struct AtomicValInner<T> {
@@ -20,14 +21,14 @@ impl<T> AtomicValInner<T> {
 
 // Interior mutability: sicuro solo grazie al lock
 unsafe impl<T: Send> Send for AtomicValInner<T> {}
-unsafe impl<T: Send + Sync> Sync for AtomicValInner<T> {}
+unsafe impl<T: Sync> Sync for AtomicValInner<T> {}
 
 #[repr(transparent)]
-pub struct AtomicVal<T> {
+pub struct Atomic<T> {
     ptr: *const AtomicValInner<T>,
 }
 
-impl<T> AtomicVal<T> {
+impl<T> Atomic<T> {
     pub fn new(val: T) -> Self {
         let inner = Box::new(AtomicValInner::new(val));
         let ptr = Box::into_raw(inner);
@@ -39,29 +40,56 @@ impl<T> AtomicVal<T> {
         unsafe { &*self.ptr }
     }
 
-    pub fn read(&self) -> WatchGuardRef<'_, T> {
+    pub fn get(&self) -> WatchGuardRef<'_, T> {
         let lock = &self.inner().state;
         lock.lock_shared();
         let val = unsafe { &*self.inner().val.get() }; // <-- da UnsafeCell
         WatchGuardRef::new(val, lock.clone())
     }
 
-    pub fn write(&self) -> WatchGuardMut<'_, T> {
+    pub fn get_mut(&self) -> WatchGuardMut<'_, T> {
         let lock = &self.inner().state;
         lock.lock_exclusive();
-        let val = unsafe { &mut *self.inner().val.get() }; // <-- da UnsafeCell
+        let val = unsafe { &mut *self.inner().val.get() };
         WatchGuardMut::new(val, lock.clone())
     }
 }
 
-impl<T> Clone for AtomicVal<T> {
+impl<T> Clone for Atomic<T> {
     fn clone(&self) -> Self {
         self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
         Self { ptr: self.ptr }
     }
 }
 
-impl<T> Drop for AtomicVal<T> {
+impl<T> Atomic<T> {
+    /// Atomic store (scrittura atomica con lock esclusivo)
+    pub fn store(&self, val: T) {
+        let mut guard = self.get_mut();
+        *guard = val;
+    }
+
+    /// Atomic swap (scambia il valore e ritorna il precedente)
+    pub fn swap(&self, val: T) -> T {
+        let mut guard = self.get_mut();
+        mem::replace(&mut *guard, val)
+    }
+}
+
+impl<T: PartialEq> Atomic<T> {
+    /// Atomic compare_exchange (CAS): se `current` == contenuto, scrive `new`, altrimenti fallisce
+    pub fn compare_exchange(&self, current: T, new: T) -> Result<T, WatchGuardMut<'_, T>> {
+        let mut guard = self.get_mut();
+        if *guard == current {
+            let old = mem::replace(&mut *guard, new);
+            Ok(old)
+        } else {
+            Err(guard)
+        }
+    }
+}
+
+impl<T> Drop for Atomic<T> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.ptr };
         if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {

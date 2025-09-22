@@ -200,6 +200,7 @@ impl Mutex {
     }
 
     /// Slow path for releasing exclusive lock, wakes waiting threads if needed
+    #[inline]
     fn unlock_exclusive_slow(&self) {
         let inner = self.inner();
         let state = inner.state.load(Ordering::Relaxed);

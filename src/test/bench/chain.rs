@@ -1,12 +1,12 @@
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
-use crate::atomic::AtomicHashMap;
+use crate::atomic::AtomicChain;
 
 fn benchmark_concurrent_rw(
     n_threads: usize,
     n_operations: usize,
-    map: AtomicHashMap<usize, usize>,
+    map: AtomicChain<usize, usize>,
 ) {
     let mut handles = Vec::new();
     let barrier = Arc::new(Barrier::new(n_threads));
@@ -52,8 +52,9 @@ fn benchmark_concurrent_rw(
 }
 
 #[test]
-fn bench_atomic_hashmap_concurrent() {
-    let map = AtomicHashMap::new();
+#[cfg_attr(miri, ignore)]
+fn bench_atomic_chain_concurrent() {
+    let map = AtomicChain::new();
 
     for &threads in &[1, 2, 4, 8, 16] {
         benchmark_concurrent_rw(threads, 100_000, map.clone());

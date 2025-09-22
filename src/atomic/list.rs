@@ -2,7 +2,6 @@ use crate::mutex::Mutex;
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::{self, null_mut};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,7 +49,9 @@ impl<T> AtomicList<T> {
             mutex: Mutex::new(),
         });
         let ptr = Box::into_raw(inner);
-        AtomicList { ptr: CachePadded::new(ptr) }
+        AtomicList {
+            ptr: CachePadded::new(ptr),
+        }
     }
 
     #[inline(always)]
@@ -134,39 +135,46 @@ impl<T> AtomicList<T> {
             None => Vec::new(),
         }
     }
+}
 
-    /// Snapshot iterator basato su clonazione
-    pub fn iter(&self) -> SnapshotIter<T>
-    where
-        T: Clone,
-    {
+pub struct Iter<'a, T> {
+    inner: &'a AtomicInner<T>,
+    current: *mut Item<T>,
+}
+
+impl<T> AtomicList<T> {
+    pub fn iter(&self) -> Iter<'_, T> {
         let inner = self.inner();
         inner.mutex.lock_shared();
-        let mut cur = unsafe { *inner.head.get() };
-        // allocheremo presumibilmente len elementi
-        let mut out = Vec::with_capacity(unsafe { *inner.len.get() });
-        while !cur.is_null() {
-            unsafe {
-                // deref manualdrop -> &T -> clone
-                out.push((&*(*cur).value).clone());
-                cur = (*cur).next;
-            }
-        }
-        inner.mutex.unlock_shared();
-        SnapshotIter { data: out.into_iter() }
+        let current = unsafe { *inner.head.get() };
+        Iter { inner, current }
     }
 }
 
-// Iteratori
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
 
-pub struct SnapshotIter<T> {
-    data: std::vec::IntoIter<T>,
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current.is_null() {
+            // Rilascia il lock quando l'iterazione finisce
+            self.inner.mutex.unlock_shared();
+            return None;
+        }
+        unsafe {
+            let item = &*(*self.current).value;
+            self.current = (*self.current).next;
+            Some(&*item)
+        }
+    }
 }
 
-impl<T> Iterator for SnapshotIter<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        self.data.next()
+impl<'a, T> Drop for Iter<'a, T> {
+    fn drop(&mut self) {
+        // Assicurati che il lock venga sempre rilasciato se l'iteratore non è terminato
+        if !self.current.is_null() {
+            self.inner.mutex.unlock_shared();
+            self.current = null_mut();
+        }
     }
 }
 

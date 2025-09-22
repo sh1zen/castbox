@@ -11,7 +11,7 @@ mod tests_atomic_hashmap {
         let vec = AtomicHashMap::new();
         let vec_c = vec.clone();
 
-        let barrier = Arc::new(Barrier::new(50));
+        let barrier = Arc::new(Barrier::new(350));
 
         vec_c.insert(1, "hello".to_string());
         vec_c.insert(2, "world".to_string());

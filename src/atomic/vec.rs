@@ -22,16 +22,13 @@ struct InnerVec<T> {
     head: CachePadded<UnsafeCell<usize>>,
     len: CachePadded<UnsafeCell<usize>>,
     cap: CachePadded<UnsafeCell<usize>>,
+    // reference count for clone/drop
+    ref_count: CachePadded<AtomicUsize>,
 
     // reader/writer mutex: lock_shared / lock_exclusive
     mutex: Mutex,
-
-    // reference count for clone/drop
-    ref_count: CachePadded<AtomicUsize>,
 }
 
-// We assert Send+Sync on AtomicVec: InnerVec contains UnsafeCell but all accesses
-// are synchronized with `mutex`. The user must ensure Mutex actually synchronizes.
 unsafe impl<T> Send for AtomicVec<T> {}
 unsafe impl<T> Sync for AtomicVec<T> {}
 

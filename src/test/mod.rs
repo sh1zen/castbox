@@ -6,5 +6,5 @@ mod atomic_list;
 mod mpmc;
 mod grutex;
 mod mutex;
-mod bench_atomic_hashmap;
 mod atomic_vec;
+mod bench;
