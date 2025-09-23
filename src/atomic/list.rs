@@ -137,47 +137,6 @@ impl<T> AtomicList<T> {
     }
 }
 
-pub struct Iter<'a, T> {
-    inner: &'a AtomicInner<T>,
-    current: *mut Item<T>,
-}
-
-impl<T> AtomicList<T> {
-    pub fn iter(&self) -> Iter<'_, T> {
-        let inner = self.inner();
-        inner.mutex.lock_shared();
-        let current = unsafe { *inner.head.get() };
-        Iter { inner, current }
-    }
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.current.is_null() {
-            // Rilascia il lock quando l'iterazione finisce
-            self.inner.mutex.unlock_shared();
-            return None;
-        }
-        unsafe {
-            let item = &*(*self.current).value;
-            self.current = (*self.current).next;
-            Some(&*item)
-        }
-    }
-}
-
-impl<'a, T> Drop for Iter<'a, T> {
-    fn drop(&mut self) {
-        // Assicurati che il lock venga sempre rilasciato se l'iteratore non è terminato
-        if !self.current.is_null() {
-            self.inner.mutex.unlock_shared();
-            self.current = null_mut();
-        }
-    }
-}
-
 pub struct Drain<T> {
     current: *mut Item<T>,
 }

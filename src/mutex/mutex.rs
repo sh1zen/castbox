@@ -203,27 +203,23 @@ impl Mutex {
     #[inline]
     fn unlock_exclusive_slow(&self) {
         let inner = self.inner();
-        let state = inner.state.load(Ordering::Relaxed);
+        let parked = inner.state.load(Ordering::Acquire);
 
-        let parked = state & (READERS_PARKED | WRITERS_PARKED);
-
-        if parked & READERS_PARKED != 0 {
-            // Case 1: readers are waiting (possibly also writers)
-            inner.state.store(
-                if parked & WRITERS_PARKED != 0 {
-                    WRITERS_PARKED
-                } else {
-                    UNLOCKED
-                },
-                Ordering::Release,
-            );
-            inner.readers_futex.fetch_add(1, Ordering::Release);
-            futex_wake_all(&*inner.readers_futex);
-        } else if parked & WRITERS_PARKED != 0 {
-            // Case 2: only writers are waiting
+        if parked & WRITERS_PARKED != 0 {
+            // Writer hanno priorità
             inner.state.store(UNLOCKED, Ordering::Release);
             inner.writers_futex.fetch_add(1, Ordering::Release);
             futex_wake(&*inner.writers_futex);
+
+        } else if parked & READERS_PARKED != 0 {
+            // Solo reader in attesa
+            inner.state.store(UNLOCKED, Ordering::Release);
+            inner.readers_futex.fetch_add(1, Ordering::Release);
+            futex_wake_all(&*inner.readers_futex);
+
+        } else {
+            // Nessuno
+            inner.state.store(UNLOCKED, Ordering::Release);
         }
     }
 

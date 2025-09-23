@@ -50,7 +50,6 @@ impl<T> AtomicVec<T> {
         let vec = Self::with_capacity(cap);
         let inner = vec.inner();
 
-        inner.mutex.lock_exclusive();
         let buf_ptr = unsafe { *inner.buf.get() };
         for i in 0..cap {
             unsafe {
@@ -60,7 +59,6 @@ impl<T> AtomicVec<T> {
         inner.set_head(0);
         inner.set_len(cap);
         inner.set_cap(cap);
-        inner.mutex.unlock_exclusive();
 
         vec
     }
@@ -96,6 +94,7 @@ impl<T> AtomicVec<T> {
     /// push: esclusivo. Semantica: push_back (aggiunge alla fine)
     pub fn push(&self, value: T) {
         let inner = self.inner();
+        let value = MaybeUninit::new(value);
         inner.mutex.lock_exclusive();
 
         let mut cap = inner.get_cap();
@@ -114,7 +113,7 @@ impl<T> AtomicVec<T> {
         let write_pos = if len == 0 { 0 } else { (head + len) % cap };
 
         unsafe {
-            buf_ptr.add(write_pos).write(MaybeUninit::new(value));
+            buf_ptr.add(write_pos).write(value);
         }
         inner.set_len(len + 1);
 
@@ -229,33 +228,6 @@ impl<T> AtomicVec<T> {
 }
 
 impl<T> AtomicVec<T> {
-    /// as_slice: shared
-    /// restituisce una copia del contenuto (shared)
-    pub fn as_slice(&self) -> Vec<T>
-    where
-        T: Clone,
-    {
-        let inner = self.inner();
-        inner.mutex.lock_shared();
-
-        let head = inner.get_head();
-        let len = inner.get_len();
-        let cap = inner.get_cap();
-
-        let buf_ptr = inner.get_buf();
-        let mut v = Vec::with_capacity(len);
-
-        if len > 0 {
-            for i in 0..len {
-                let pos = (head + i) % cap;
-                let item = unsafe { (&*buf_ptr.add(pos)).assume_init_ref() };
-                v.push(item.clone());
-            }
-        }
-
-        inner.mutex.unlock_shared();
-        v
-    }
 
     /// Consuma i dati correnti e li restituisce come `Vec<T>`.
     /// Dopo la chiamata, l'AtomicVec risulta vuoto.
@@ -343,7 +315,6 @@ impl<T> InnerVec<T> {
     fn resize_internal(&self, new_cap: usize) {
         let old_cap = self.get_cap();
 
-        // todo add support to shrinking
         if old_cap >= new_cap {
             return;
         }

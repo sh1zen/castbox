@@ -197,7 +197,7 @@ mod tests_atomic_vec {
         v.push(2);
         v.push(3);
 
-        let slice = v.as_slice();
+        let slice = v.as_vec();
         assert_eq!(slice, vec![1, 2, 3]);
     }
 
@@ -233,14 +233,14 @@ mod tests_atomic_vec {
         v.push(60);
 
         // as_slice deve restituire in ordine logico, non fisico
-        let slice = v.as_slice();
+        let slice = v.as_vec();
         assert_eq!(slice, vec![30, 40, 50, 60]);
     }
 
     #[test]
     fn test_as_slice_empty() {
         let v: AtomicVec<i32> = AtomicVec::new();
-        let slice = v.as_slice();
+        let slice = v.as_vec();
         assert!(slice.is_empty());
     }
 }

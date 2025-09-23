@@ -19,7 +19,7 @@ fn bench_list(){
         let handle = thread::spawn(move || {
 
             for i in 0..OPERATIONS_PER_THREAD {
-                let op =i % 4;
+                let op =i % 3;
 
                 match op {
                     0 => {
@@ -33,12 +33,6 @@ fn bench_list(){
                     2 => {
                         // 5% to_vec (drain)
                         let _ = list_clone.to_vec();
-                    }
-                    3 => {
-                        // 5% read-only iter
-                        for val in list_clone.iter() {
-                            let _ = val;
-                        }
                     }
                     _ => unreachable!(),
                 }

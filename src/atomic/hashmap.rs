@@ -71,7 +71,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
 
     #[inline]
     fn get_slot(&self, index: usize) -> Option<&Slot<K, V>> {
-        Some(unsafe { &*self.slots.get(index)? })
+        Some(unsafe { &**self.slots.get(index)? })
     }
 
     fn insert(&self, slot_idx: usize, key: K, value: V) -> Option<V> {
@@ -250,7 +250,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
                 entry.key.hash(&mut h);
                 let new_slot_idx = (h.finish() as usize) % new_size;
 
-                let new_slot = unsafe { &*self.slots.get(new_slot_idx).unwrap() };
+                let new_slot = unsafe { &**self.slots.get(new_slot_idx).unwrap() };
 
                 entry
                     .next
@@ -274,7 +274,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         for i in 0..size {
             if let Some(slot_ptr) = self.slots.get(i) {
                 unsafe {
-                    let slot = &*slot_ptr;
+                    let slot = &**slot_ptr;
                     let mut cur = slot.head.load(Ordering::Acquire);
                     while !cur.is_null() {
                         total += 1;
@@ -293,7 +293,7 @@ impl<K, V> Shard<K, V> {
         for i in 0..size {
             if let Some(slot_ptr) = self.slots.get(i) {
                 unsafe {
-                    let slot = &*slot_ptr;
+                    let slot = &**slot_ptr;
                     let mut cur = slot.head.load(Ordering::Acquire);
                     while !cur.is_null() {
                         let next = (*cur).next.load(Ordering::Acquire);
@@ -301,7 +301,7 @@ impl<K, V> Shard<K, V> {
                         drop(Box::from_raw(cur));
                         cur = next;
                     }
-                    drop(Box::from_raw(slot_ptr));
+                    drop(Box::from_raw(*slot_ptr));
                 }
             }
         }
