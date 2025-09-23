@@ -29,7 +29,7 @@ impl<T> Mpmc<T> {
     /// create a new bounded channel
     pub fn bounded(n: usize) -> Mpmc<T> {
         let ptr = Box::into_raw(Box::new(MpmcInner {
-            buffer: AtomicVec::with_capacity(n),
+            buffer: AtomicVec::new(),
             mutex: SMutex::new(),
             condvar: SCondVar::new(),
             ref_count: AtomicUsize::new(1),

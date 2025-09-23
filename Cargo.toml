@@ -22,7 +22,7 @@ crossbeam-utils = "0.8.21"
 crossbeam = "0.8.4"
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
-libc = "0.2.175"
+libc = "0.2.176"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.0", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_System_WindowsProgramming"] }

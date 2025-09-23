@@ -1,14 +1,15 @@
-use crate::mutex::{Mutex, WatchGuardRef};
+use crate::mutex::{Backoff, Mutex, WatchGuardRef};
 use crossbeam_utils::CachePadded;
+use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FromIterator;
 use std::mem::MaybeUninit;
-use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr::null_mut;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Default initial capacity
-const DEFAULT_CAP: usize = 16;
+const BLOCK_CAP: usize = 32;
 
 /// Thread-safe Vec, clonable
 #[repr(transparent)]
@@ -16,15 +17,88 @@ pub struct AtomicVec<T> {
     ptr: CachePadded<*const InnerVec<T>>,
 }
 
+struct Slot<T> {
+    /// The value.
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T> Slot<T> {
+    fn write(&self, value: T) {
+        unsafe {
+            self.value.get().write(MaybeUninit::new(value));
+        }
+    }
+
+    fn read(&self) -> T {
+        unsafe { self.value.get().read().assume_init() }
+    }
+
+    fn get_ref(&self) -> &T {
+        unsafe { (&*self.value.get()).assume_init_ref() }
+    }
+
+    fn get_mut(&self) -> &T {
+        unsafe { (&mut *self.value.get()).assume_init_mut() }
+    }
+}
+
+struct Block<T> {
+    /// The next block in the linked list.
+    next: AtomicPtr<Block<T>>,
+    /// Slots for values.
+    slots: [Slot<T>; BLOCK_CAP],
+}
+
+#[inline(always)]
+fn block_index(pos: usize) -> usize {
+    pos >> 5
+}
+
+#[inline(always)]
+fn index_in_block(pos: usize) -> usize {
+    pos & (BLOCK_CAP - 1)
+}
+
+impl<T> Block<T> {
+    const LAYOUT: Layout = {
+        let layout = Layout::new::<Self>();
+        assert!(
+            layout.size() != 0,
+            "Block should never be zero-sized, as it has an AtomicPtr field"
+        );
+        layout
+    };
+
+    /// Creates an empty block.
+    fn new() -> Box<Self> {
+        // SAFETY: layout is not zero-sized
+
+        let ptr = unsafe { alloc_zeroed(Self::LAYOUT) };
+        // Handle allocation failure
+
+        if ptr.is_null() {
+            handle_alloc_error(Self::LAYOUT)
+        }
+        // SAFETY: This is safe because:
+        //  [1] `Block::next` (AtomicPtr) may be safely zero initialized.
+        //  [2] `Block::slots` (Array) may be safely zero initialized because of [3, 4].
+        //  [3] `Slot::value` (UnsafeCell) may be safely zero initialized because it
+        //       holds a MaybeUninit.
+        //  [4] `Slot::state` (AtomicUsize) may be safely zero initialized.
+        // TODO: unsafe { Box::new_zeroed().assume_init() }
+
+        unsafe { Box::from_raw(ptr.cast()) }
+    }
+}
+
 struct InnerVec<T> {
     // padded fields for better cache isolation
-    buf: CachePadded<UnsafeCell<*mut MaybeUninit<T>>>,
+    buf: Box<Block<T>>,
     head: CachePadded<UnsafeCell<usize>>,
     len: CachePadded<UnsafeCell<usize>>,
     cap: CachePadded<UnsafeCell<usize>>,
     // reference count for clone/drop
     ref_count: CachePadded<AtomicUsize>,
-
     // reader/writer mutex: lock_shared / lock_exclusive
     mutex: Mutex,
 }
@@ -34,12 +108,7 @@ unsafe impl<T> Sync for AtomicVec<T> {}
 
 impl<T> AtomicVec<T> {
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_CAP)
-    }
-
-    pub fn with_capacity(cap: usize) -> Self {
-        let inner = Box::new(InnerVec::new(cap.max(1)));
-        let ptr = Box::into_raw(inner);
+        let ptr = Box::into_raw(Box::new(InnerVec::new()));
         Self {
             ptr: CachePadded::new(ptr),
         }
@@ -47,18 +116,15 @@ impl<T> AtomicVec<T> {
 
     /// init_with: costruisce e popola il buffer — operazione esclusiva
     pub fn init_with<F: FnMut() -> T>(cap: usize, mut initializer: F) -> Self {
-        let vec = Self::with_capacity(cap);
+        let vec = Self::new();
         let inner = vec.inner();
 
-        let buf_ptr = unsafe { *inner.buf.get() };
-        for i in 0..cap {
-            unsafe {
-                buf_ptr.add(i).write(MaybeUninit::new(initializer()));
-            }
+        for _ in 0..cap {
+            vec.push(initializer());
         }
+
         inner.set_head(0);
         inner.set_len(cap);
-        inner.set_cap(cap);
 
         vec
     }
@@ -94,27 +160,16 @@ impl<T> AtomicVec<T> {
     /// push: esclusivo. Semantica: push_back (aggiunge alla fine)
     pub fn push(&self, value: T) {
         let inner = self.inner();
-        let value = MaybeUninit::new(value);
         inner.mutex.lock_exclusive();
 
-        let mut cap = inner.get_cap();
-        let mut len = inner.get_len();
+        let cap = inner.get_cap();
+        let len = inner.get_len();
         let head = inner.get_head();
-
-        if len == cap {
-            // buffer full -> resize (manteniamo il lock esclusivo durante la resize)
-            inner.resize_internal(cap * 2);
-            cap = inner.get_cap();
-            len = inner.get_len();
-        }
-
-        let buf_ptr = unsafe { *inner.buf.get() };
 
         let write_pos = if len == 0 { 0 } else { (head + len) % cap };
 
-        unsafe {
-            buf_ptr.add(write_pos).write(value);
-        }
+        inner.get_slot(write_pos).write(value);
+
         inner.set_len(len + 1);
 
         inner.mutex.unlock_exclusive();
@@ -133,9 +188,8 @@ impl<T> AtomicVec<T> {
 
         let head = inner.get_head();
         let cap = inner.get_cap();
-        let buf_ptr = inner.get_buf();
 
-        let value = unsafe { buf_ptr.add(head).read().assume_init() };
+        let value = inner.get_slot(head).read();
 
         if len == 1 {
             // now empty: reset head to 0 for canonical state
@@ -165,62 +219,26 @@ impl<T> AtomicVec<T> {
         }
 
         let pos = (head + index) % cap;
-        let buf_ptr = unsafe { *inner.buf.get() };
 
-        let value = unsafe { (&*buf_ptr.add(pos)).assume_init_ref() };
+        let value = inner.get_slot(pos).get_ref();
 
         Some(WatchGuardRef::new(value, inner.mutex.clone()))
     }
 
-    /// resize pubblica: acquisisce lock esclusivo e chiama la funzione di resize interna
-    pub fn resize(&self, new_cap: usize) -> usize {
-        let inner = self.inner();
-        inner.mutex.lock_exclusive();
-        inner.resize_internal(new_cap);
-        inner.mutex.unlock_exclusive();
-        new_cap
-    }
-
-    // Simplified reset_with: no RAII guard, less panic-safety (user requested simplification)
     pub fn reset_with(&self, new_cap: usize, mut initializer: impl FnMut() -> T) -> usize {
         let inner = self.inner();
         inner.mutex.lock_exclusive();
 
-        let old_head = inner.get_head();
-        let old_len = inner.get_len();
-        let old_cap = inner.get_cap();
-        let old_buf = inner.get_buf();
-
         // allocate and initialize new buffer. NOTE: if initializer panics here,
         // the new buffer may leak — this function is intentionally simplified.
-        let new_cap = new_cap.max(1);
-        let new_buf = InnerVec::alloc_buffer(new_cap);
         for i in 0..new_cap {
-            unsafe {
-                new_buf.add(i).write(MaybeUninit::new(initializer()));
-            }
-        }
-
-        // drop old elements safely
-        if std::mem::needs_drop::<T>() && old_len > 0 {
-            for i in 0..old_len {
-                let idx = (old_head + i) % old_cap;
-                unsafe {
-                    ptr::drop_in_place(old_buf.add(idx).cast::<T>());
-                }
-            }
-        }
-
-        unsafe {
-            let old_layout = std::alloc::Layout::array::<MaybeUninit<T>>(old_cap).unwrap();
-            std::alloc::dealloc(old_buf.cast::<u8>(), old_layout);
+            let slot = inner.get_slot(i);
+            slot.write(initializer());
         }
 
         // commit new buffer: it is fully initialized and contains `new_cap` elements
-        inner.set_buf(new_buf);
         inner.set_head(0);
         inner.set_len(new_cap);
-        inner.set_cap(new_cap);
 
         inner.mutex.unlock_exclusive();
         new_cap
@@ -228,7 +246,6 @@ impl<T> AtomicVec<T> {
 }
 
 impl<T> AtomicVec<T> {
-
     /// Consuma i dati correnti e li restituisce come `Vec<T>`.
     /// Dopo la chiamata, l'AtomicVec risulta vuoto.
     pub fn as_vec(&self) -> Vec<T> {
@@ -239,14 +256,11 @@ impl<T> AtomicVec<T> {
         let len = inner.get_len();
         let cap = inner.get_cap();
 
-        let buf_ptr = inner.get_buf();
         let mut out = Vec::with_capacity(len);
 
-        unsafe {
-            for i in 0..len {
-                let pos = (head + i) % cap;
-                out.push(buf_ptr.add(pos).read().assume_init());
-            }
+        for i in 0..len {
+            let pos = (head + i) % cap;
+            out.push(inner.get_slot(pos).read());
         }
 
         // reset indices: buffer ora considerato vuoto
@@ -259,19 +273,17 @@ impl<T> AtomicVec<T> {
 }
 
 impl<T> InnerVec<T> {
-    fn new(cap: usize) -> Self {
-        let buf = Self::alloc_buffer(cap);
+    fn new() -> Self {
         Self {
-            buf: CachePadded::new(UnsafeCell::new(buf)),
+            buf: Block::<T>::new(),
             head: CachePadded::new(UnsafeCell::new(0)),
             len: CachePadded::new(UnsafeCell::new(0)),
-            cap: CachePadded::new(UnsafeCell::new(cap)),
+            cap: CachePadded::new(UnsafeCell::new(BLOCK_CAP)),
             mutex: Mutex::new(),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
         }
     }
 
-    // getter/setter per head/len/cap/buf (usare SOLO con lock appropriato)
     #[inline(always)]
     fn get_head(&self) -> usize {
         unsafe { *self.head.get() }
@@ -298,61 +310,50 @@ impl<T> InnerVec<T> {
     }
 
     #[inline(always)]
-    fn set_cap(&self, v: usize) {
-        unsafe { *self.cap.get() = v }
-    }
+    fn get_block(&self, n: usize) -> &Block<T> {
+        let mut block = &*self.buf;
+        for _ in 0..n {
+            // carichiamo l'attuale next
+            let mut next = block.next.load(Ordering::Acquire);
+            if next.is_null() {
+                // proviamo ad allocare un nuovo block e a installarlo atomically
+                let new = Box::into_raw(Block::new());
 
-    #[inline(always)]
-    fn get_buf(&self) -> *mut MaybeUninit<T> {
-        unsafe { *self.buf.get() }
-    }
-    #[inline(always)]
-    fn set_buf(&self, p: *mut MaybeUninit<T>) {
-        unsafe { *self.buf.get() = p }
-    }
-
-    /// internal resize: assume di avere il lock esclusivo
-    fn resize_internal(&self, new_cap: usize) {
-        let old_cap = self.get_cap();
-
-        if old_cap >= new_cap {
-            return;
-        }
-
-        let head = self.get_head();
-        let len = self.get_len();
-        let old_buf = self.get_buf();
-        let new_buf = Self::alloc_buffer(new_cap);
-
-        unsafe {
-            if len > 0 {
-                for i in 0..len {
-                    let idx = (head + i) % old_cap;
-                    let value = old_buf.add(idx).read().assume_init();
-                    new_buf.add(i).write(MaybeUninit::new(value));
+                match block.next.compare_exchange(
+                    null_mut(),
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // abbiamo vinto la gara: `new` è ora installato come next
+                        // aggiorniamo la capacità (nota: questo muta l'UnsafeCell)
+                        unsafe { *self.cap.get() += BLOCK_CAP };
+                        next = new;
+                    }
+                    Err(actual) => {
+                        // qualcun altro ha installato `actual` prima di noi:
+                        // liberiamo la nostra allocazione per evitare leak
+                        unsafe { drop(Box::from_raw(new)); }
+                        next = actual;
+                    }
                 }
             }
-
-            // dealloc old buffer
-            let old_layout = std::alloc::Layout::array::<MaybeUninit<T>>(old_cap).unwrap();
-            std::alloc::dealloc(old_buf.cast::<u8>(), old_layout);
+            // a questo punto `next` non è null
+            block = unsafe { &*next };
         }
 
-        // aggiorniamo pointer e indici
-        self.set_buf(new_buf);
-        self.set_head(0);
-        self.set_len(len);
-        self.set_cap(new_cap);
+        block
     }
 
-    fn alloc_buffer(cap: usize) -> *mut MaybeUninit<T> {
-        let layout = std::alloc::Layout::array::<MaybeUninit<T>>(cap).unwrap();
-        unsafe {
-            let ptr = std::alloc::alloc(layout) as *mut MaybeUninit<T>;
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            ptr
+    #[inline(always)]
+    fn get_slot(&self, pos: usize) -> &Slot<T> {
+        let block = self.get_block(block_index(pos));
+
+        if let Some(slot) = block.slots.get(index_in_block(pos)) {
+            slot
+        } else {
+            panic!("trying to get slot out of bounds");
         }
     }
 }
@@ -387,23 +388,29 @@ impl<T> Drop for AtomicVec<T> {
                 let head = boxed.get_head();
                 let len = boxed.get_len();
                 let cap = boxed.get_cap();
-                let buf_ptr = boxed.get_buf();
 
+                // Drop elements
                 if std::mem::needs_drop::<T>() && len > 0 {
                     for i in 0..len {
                         let idx = (head + i) % cap;
-                        ptr::drop_in_place(buf_ptr.add(idx).cast::<T>());
+                        let slot = boxed.get_slot(idx);
+                        slot.value.get().drop_in_place();
                     }
                 }
 
-                let layout = std::alloc::Layout::array::<MaybeUninit<T>>(cap).unwrap();
-                std::alloc::dealloc(buf_ptr.cast::<u8>(), layout);
-                // boxed is dropped here
+                // Deallocate blocks
+                let mut block_ptr: *mut Block<T> = Box::into_raw(boxed.buf);
+
+                while !block_ptr.is_null() {
+                    let next = (*block_ptr).next.load(Ordering::Acquire);
+                    // Deallocate current block
+                    drop(Box::from_raw(block_ptr));
+                    block_ptr = next;
+                }
             }
         }
     }
 }
-
 
 impl<T> FromIterator<T> for AtomicVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {

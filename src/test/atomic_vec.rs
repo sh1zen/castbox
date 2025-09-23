@@ -205,18 +205,18 @@ mod tests_atomic_vec {
     fn test_as_vec() {
         let v = AtomicVec::init_with(2, || 1);
         assert_eq!(v.len(), 2);
-        assert_eq!(v.capacity(), 2);
+        assert_eq!(v.capacity(), 32);
         assert_eq!(v.as_vec(), vec![1, 1]);
 
         let v = AtomicVec::init_with(1, || 1);
         assert_eq!(v.len(), 1);
-        assert_eq!(v.capacity(), 1);
+        assert_eq!(v.capacity(), 32);
         assert_eq!(v.as_vec(), vec![1]);
     }
 
     #[test]
     fn test_as_slice_wraparound() {
-        let v = AtomicVec::with_capacity(4);
+        let v = AtomicVec::new();
 
         // Riempie il buffer fino a forzare il wrap-around
         v.push(10);
