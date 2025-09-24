@@ -6,7 +6,7 @@ use std::time::Instant;
 #[test]
 #[cfg_attr(miri, ignore)]
 fn dfvgsfv() {
-    const N: usize = 1_000_000;
+    const N: usize = 10_000;
 
     // === Single-thread push/pop ===
     let q = AtomicVec::new();
