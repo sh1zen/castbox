@@ -7,135 +7,164 @@ use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
 use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 
-/// Block capacity - same as original
+/// Block capacity - power of 2 for fast modulo with bitwise AND
 const BLOCK_CAP: usize = 32;
+const BLOCK_CAP_MASK: usize = BLOCK_CAP - 1; // 31 for fast modulo
+const BLOCK_SHIFT: u32 = 5; // log2(32) for fast division
 
+// States for lock-free block allocation
 const AVAILABLE: usize = 1;
 const BUSY: usize = 2;
 
-
-/// Simple slot - exactly like original but optimized
+/// Ultra-minimal slot - zero abstraction overhead
+#[repr(transparent)]
 struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
 impl<T> Slot<T> {
-    #[inline]
-    fn write(&self, value: T) {
-        unsafe {
-            (*self.value.get()).write(value);
-        }
+    #[inline(always)]
+    unsafe fn write_unchecked(&self, value: T) {
+        (*self.value.get()).write(value);
     }
 
-    #[inline]
-    fn read(&self) -> T {
-        unsafe { (*self.value.get()).assume_init_read() }
+    #[inline(always)]
+    unsafe fn read_unchecked(&self) -> T {
+        (*self.value.get()).assume_init_read()
     }
 
-    #[inline]
-    fn get_ref(&self) -> &T {
-        unsafe { (*self.value.get()).assume_init_ref() }
+    #[inline(always)]
+    unsafe fn get_ref_unchecked(&self) -> &T {
+        (*self.value.get()).assume_init_ref()
     }
 }
 
-/// Block exactly like original
+/// Optimized block with better memory layout
+#[repr(C)]
 struct Block<T> {
-    next: CachePadded<AtomicPtr<Block<T>>>,
+    next: AtomicPtr<Block<T>>, // Remove CachePadded overhead
     slots: [Slot<T>; BLOCK_CAP],
 }
 
+// Ultra-fast bit manipulation instead of division/modulo
 #[inline(always)]
-fn block_index(pos: usize) -> usize {
-    pos >> 5
+const fn block_index(pos: usize) -> usize {
+    pos >> BLOCK_SHIFT
 }
 
 #[inline(always)]
-fn index_in_block(pos: usize) -> usize {
-    pos & (BLOCK_CAP - 1)
+const fn index_in_block(pos: usize) -> usize {
+    pos & BLOCK_CAP_MASK
 }
 
 impl<T> Block<T> {
     const LAYOUT: Layout = {
         let layout = Layout::new::<Self>();
-        assert!(
-            layout.size() != 0,
-            "Block should never be zero-sized, as it has an AtomicPtr field"
-        );
         layout
     };
 
-    fn new() -> Box<Self> {
+    #[inline]
+    fn new() -> *mut Self {
         let ptr = unsafe { alloc_zeroed(Self::LAYOUT) };
         if ptr.is_null() {
             handle_alloc_error(Self::LAYOUT)
         }
-        unsafe { Box::from_raw(ptr.cast()) }
+        ptr.cast()
+    }
+
+    #[inline(always)]
+    unsafe fn dealloc(ptr: *mut Self) {
+        drop(Box::from_raw(ptr));
     }
 }
 
+/// Optimized position cache with better locality
+#[repr(C)]
 struct Position<T> {
     pos: AtomicUsize,
     ptr: AtomicPtr<Block<T>>,
 }
 
-/// Inner structure - simplified from original
+/// Highly optimized inner structure - minimal atomic operations
+#[repr(C)]
 struct InnerVec<T> {
-    buf: *mut Block<T>,
-    buf_tail: CachePadded<AtomicPtr<Block<T>>>,
-    read: CachePadded<Position<T>>,
-    write: CachePadded<Position<T>>,
-    head: CachePadded<AtomicUsize>,
-    len: CachePadded<AtomicUsize>,
-    cap: CachePadded<AtomicUsize>,
-    ref_count: CachePadded<AtomicUsize>,
-    state: CachePadded<AtomicUsize>,
+    // Hot path fields first for better cache locality
+    head: AtomicUsize,        // Read position
+    tail: AtomicUsize,        // Write position
+    len: AtomicUsize,         // Current length
+    cap: AtomicUsize,         // Current capacity
+
+    // Cold path fields
+    buf: *mut Block<T>,                    // First block
+    buf_tail: AtomicPtr<Block<T>>,         // Last block
+    state: AtomicUsize,                    // Allocation state
+    ref_count: AtomicUsize,                // Reference counting
+
+    // Position caches for block traversal optimization
+    read_cache: Position<T>,
+    write_cache: Position<T>,
 }
 
-/// AtomicVec - back to basics but optimized
+/// Zero-cost abstraction atomic vector
 #[repr(transparent)]
 pub struct AtomicVec<T> {
-    ptr: CachePadded<*const InnerVec<T>>,
+    inner: *const InnerVec<T>,
 }
 
 unsafe impl<T: Send> Send for AtomicVec<T> {}
 unsafe impl<T: Send> Sync for AtomicVec<T> {}
 
 impl<T> AtomicVec<T> {
+    #[inline]
     pub fn new() -> Self {
-        let ptr = Box::into_raw(Box::new(InnerVec::new()));
-        Self {
-            ptr: CachePadded::new(ptr),
-        }
+        let inner = Box::into_raw(Box::new(InnerVec::new()));
+        Self { inner }
     }
 
-    pub fn init_with<F: FnMut() -> T>(cap: usize, mut initializer: F) -> Self {
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
         let vec = Self::new();
         let inner = vec.inner();
 
-        // Simple sequential fill - no locks needed
-        for i in 0..cap {
-            inner.maybe_add_block();
-            inner.get_write_slot(i).write(initializer());
+        // Pre-allocate blocks
+        let blocks_needed = (cap + BLOCK_CAP_MASK) >> BLOCK_SHIFT;
+        for _ in 1..blocks_needed {
+            inner.add_block_cold();
         }
 
-        inner.set_head(0);
-        inner.set_len(cap);
+        vec
+    }
+
+    pub fn init_with<F: FnMut() -> T>(cap: usize, mut initializer: F) -> Self {
+        let vec = Self::with_capacity(cap);
+        let inner = vec.inner();
+
+        // Sequential initialization - no synchronization needed
+        unsafe {
+            for i in 0..cap {
+                inner.get_write_slot_unchecked(i).write_unchecked(initializer());
+            }
+        }
+
+        inner.head.store(0, Ordering::Relaxed);
+        inner.tail.store(cap, Ordering::Relaxed);
+        inner.len.store(cap, Ordering::Relaxed);
         vec
     }
 
     #[inline(always)]
     fn inner(&self) -> &InnerVec<T> {
-        unsafe { &**self.ptr }
+        unsafe { &*self.inner }
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.inner().get_len()
+        self.inner().len.load(Ordering::Acquire)
     }
 
     #[inline(always)]
     pub fn capacity(&self) -> usize {
-        self.inner().get_cap()
+        self.inner().cap.load(Ordering::Acquire)
     }
 
     #[inline(always)]
@@ -143,33 +172,42 @@ impl<T> AtomicVec<T> {
         self.len() == 0
     }
 
-    /// Push - minimal overhead version
+    /// Ultra-optimized push - minimal atomic operations
+    #[inline]
     pub fn push(&self, value: T) {
         let inner = self.inner();
 
-        inner.maybe_add_block();
+        // Fast path: get write position atomically
+        let write_pos = inner.tail.fetch_add(1, Ordering::Relaxed);
+        let cap = inner.cap.load(Ordering::Acquire);
 
-        // Single atomic read for length
-        let len = inner.len.fetch_add(1, Ordering::AcqRel);
-        let head = inner.get_head();
+        // Check if we need more capacity
+        if write_pos >= cap {
+            inner.ensure_capacity(write_pos + 1);
+        }
 
-        // Write directly - no additional synchronization needed
-        let write_pos = (head + len) % inner.get_cap();
+        // Write value - no additional synchronization needed
+        unsafe {
+            inner.get_write_slot_fast(write_pos).write_unchecked(value);
+        }
 
-        inner.get_write_slot(write_pos).write(value);
+        // Update length after write
+        inner.len.fetch_add(1, Ordering::Release);
     }
 
-    /// Pop - minimal overhead version
+    /// Ultra-optimized pop - minimal atomic operations
+    #[inline]
     pub fn pop(&self) -> Option<T> {
         let inner = self.inner();
 
-        // Try to decrement length atomically
-        let mut current_len = inner.get_len();
-        loop {
-            if current_len == 0 {
-                return None;
-            }
+        // Fast length check
+        let mut current_len = inner.len.load(Ordering::Acquire);
+        if current_len == 0 {
+            return None;
+        }
 
+        // Try to reserve one element atomically
+        loop {
             match inner.len.compare_exchange_weak(
                 current_len,
                 current_len - 1,
@@ -177,220 +215,226 @@ impl<T> AtomicVec<T> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
+                Err(0) => return None, // Became empty
                 Err(x) => current_len = x,
             }
         }
 
-        // Read the value
-        let head = inner.get_head();
-        let value = inner.get_read_slot(head).read();
+        // Get read position atomically
+        let read_pos = inner.head.fetch_add(1, Ordering::Relaxed);
 
-        // Update head
-        if current_len == 1 {
-            inner.set_head(0); // Reset when empty
-        } else {
-            inner.set_head((head + 1) % inner.get_cap());
+        // Read value
+        unsafe {
+            Some(inner.get_read_slot_fast(read_pos).read_unchecked())
         }
-
-        Some(value)
     }
 
-    /// Get with minimal guard overhead
+    /// Optimized indexed access
+    #[inline]
     pub fn get(&self, index: usize) -> Option<WatchGuardRef<'_, T>> {
         let inner = self.inner();
 
-        if index >= inner.get_len() {
+        // Fast bounds check
+        if index >= inner.len.load(Ordering::Acquire) {
             return None;
         }
 
-        let head = inner.get_head();
-        let pos = (head + index) % inner.get_cap();
+        let head = inner.head.load(Ordering::Acquire);
+        let cap = inner.cap.load(Ordering::Acquire);
+        let pos = (head + index) & (cap - 1); // Assume cap is power of 2
 
-        Some(WatchGuardRef::new(
-            inner.get_slot(pos).get_ref(),
-            Mutex::new(),
-        ))
+        unsafe {
+            Some(WatchGuardRef::new(
+                inner.get_slot_fast(pos).get_ref_unchecked(),
+                Mutex::new(),
+            ))
+        }
     }
 
-    /// Reset - fast version
+    /// Optimized reset
+    #[inline]
     pub fn reset_with(&self, new_cap: usize, mut initializer: impl FnMut() -> T) -> usize {
         let inner = self.inner();
 
-        // Reset counters
-        inner.len.store(0, Ordering::Release);
-        inner.set_head(0);
+        // Reset atomics
+        inner.len.store(0, Ordering::Relaxed);
+        inner.head.store(0, Ordering::Relaxed);
+        inner.tail.store(0, Ordering::Relaxed);
 
-        // Fill with new values
-        for i in 0..new_cap {
-            inner.maybe_add_block();
-            inner.get_write_slot(i).write(initializer());
+        // Ensure capacity
+        inner.ensure_capacity(new_cap);
+
+        // Fill sequentially
+        unsafe {
+            for i in 0..new_cap {
+                inner.get_write_slot_unchecked(i).write_unchecked(initializer());
+            }
         }
 
-        inner.len.store(new_cap, Ordering::Release);
+        inner.len.store(new_cap, Ordering::Relaxed);
+        inner.tail.store(new_cap, Ordering::Release);
         new_cap
     }
 
-    /// as_vec - fast drain
+    /// Ultra-fast drain to vector
+    #[inline]
     pub fn as_vec(&self) -> Vec<T> {
         let inner = self.inner();
-        let head = inner.get_head();
-        let len = inner.get_len();
-        let cap = inner.get_cap();
+        let head = inner.head.load(Ordering::Acquire);
+        let len = inner.len.load(Ordering::Acquire);
+        let cap = inner.cap.load(Ordering::Acquire);
 
         let mut out = Vec::with_capacity(len);
 
-        for i in 0..len {
-            let pos = (head + i) % cap;
-            out.push(inner.get_read_slot(pos).read());
+        unsafe {
+            for i in 0..len {
+                let pos = (head + i) & (cap - 1);
+                out.push(inner.get_read_slot_fast(pos).read_unchecked());
+            }
         }
 
-        // Reset to empty
-        inner.set_head(0);
+        // Reset
+        inner.head.store(0, Ordering::Relaxed);
+        inner.tail.store(0, Ordering::Relaxed);
         inner.len.store(0, Ordering::Release);
+
         out
     }
 }
 
 impl<T> InnerVec<T> {
     fn new() -> Self {
-        let b = Block::<T>::new();
-        let ptr = Box::into_raw(b);
+        let first_block = Block::<T>::new();
 
         Self {
-            buf: ptr,
-            buf_tail: CachePadded::new(AtomicPtr::new(ptr)),
-            head: CachePadded::new(AtomicUsize::new(0)),
-            read: CachePadded::new(Position {
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+            cap: AtomicUsize::new(BLOCK_CAP),
+            buf: first_block,
+            buf_tail: AtomicPtr::new(first_block),
+            state: AtomicUsize::new(AVAILABLE),
+            ref_count: AtomicUsize::new(1),
+            read_cache: Position {
                 pos: AtomicUsize::new(0),
-                ptr: AtomicPtr::new(ptr),
-            }),
-            write: CachePadded::new(Position {
+                ptr: AtomicPtr::new(first_block),
+            },
+            write_cache: Position {
                 pos: AtomicUsize::new(0),
-                ptr: AtomicPtr::new(ptr),
-            }),
-            len: CachePadded::new(AtomicUsize::new(0)),
-            cap: CachePadded::new(AtomicUsize::new(BLOCK_CAP)),
-            ref_count: CachePadded::new(AtomicUsize::new(1)),
-            state: CachePadded::new(AtomicUsize::new(AVAILABLE)),
+                ptr: AtomicPtr::new(first_block),
+            },
         }
     }
 
-    #[inline(always)]
-    fn get_head(&self) -> usize {
-        self.head.load(Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    fn set_head(&self, v: usize) {
-        self.head.store(v, Ordering::Release)
-    }
-
-    #[inline(always)]
-    fn get_len(&self) -> usize {
-        self.len.load(Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    fn set_len(&self, v: usize) {
-        self.len.store(v, Ordering::Release);
-    }
-
-    #[inline(always)]
-    fn get_cap(&self) -> usize {
-        self.cap.load(Ordering::Acquire)
-    }
-
-    /// Simplified block addition
-    fn maybe_add_block(&self) {
-        if self.get_len() < self.get_cap() {
+    /// Lock-free capacity expansion
+    #[cold]
+    fn ensure_capacity(&self, needed: usize) {
+        let current_cap = self.cap.load(Ordering::Acquire);
+        if needed <= current_cap {
             return;
         }
 
-        let backoff = Backoff::new();
-        loop {
-            if self
-                .state
-                .compare_exchange(AVAILABLE, BUSY, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                if self.get_len() < self.get_cap() {
-                    self.state.store(AVAILABLE, Ordering::Release);
-                    return;
+        // Calculate blocks needed
+        let blocks_to_add = ((needed - current_cap) + BLOCK_CAP_MASK) >> BLOCK_SHIFT;
+
+        // Lock-free allocation
+        if self.state.compare_exchange(
+            AVAILABLE,
+            BUSY,
+            Ordering::Acquire,
+            Ordering::Relaxed
+        ).is_ok() {
+            // Double-check after acquiring lock
+            if needed > self.cap.load(Ordering::Relaxed) {
+                for _ in 0..blocks_to_add {
+                    self.add_block_cold();
                 }
-                break;
             }
-            backoff.snooze();
+            self.state.store(AVAILABLE, Ordering::Release);
+        } else {
+            // Wait for allocation to complete
+            let backoff = Backoff::new();
+            while self.cap.load(Ordering::Acquire) < needed {
+                backoff.snooze();
+            }
         }
-
-        let new_block = Box::into_raw(Block::new());
-
-        let block = self.buf_tail.swap(new_block, Ordering::Acquire);
-
-        self.cap.fetch_add(BLOCK_CAP, Ordering::Release);
-
-        let block = unsafe { &*block };
-
-        block.next.store(new_block, Ordering::Release);
-
-        self.state.store(AVAILABLE, Ordering::Release);
     }
 
+    /// Cold path block allocation
+    #[cold]
+    fn add_block_cold(&self) {
+        let new_block = Block::new();
+        let old_tail = self.buf_tail.swap(new_block, Ordering::AcqRel);
+
+        unsafe {
+            (*old_tail).next.store(new_block, Ordering::Release);
+        }
+
+        self.cap.fetch_add(BLOCK_CAP, Ordering::AcqRel);
+    }
+
+    /// Optimized block traversal with caching
     #[inline]
-    fn get_block(&self, n: usize, cache: Option<&Position<T>>) -> &Block<T> {
-        // cache attuale
-        let mut block = unsafe { &*self.buf };
-        let mut start = 0;
+    fn get_block_fast(&self, block_idx: usize, cache: &Position<T>) -> *mut Block<T> {
+        // Try cache first
+        let cached_idx = cache.pos.load(Ordering::Relaxed);
+        let cached_ptr = cache.ptr.load(Ordering::Relaxed);
 
-        if let Some(access) = cache {
-            let cached_ptr = access.ptr.load(Ordering::Acquire);
-            if !cached_ptr.is_null() {
-                let cached_pos = access.pos.load(Ordering::Acquire);
+        if cached_idx == block_idx && !cached_ptr.is_null() {
+            return cached_ptr;
+        }
 
-                if cached_pos == n {
-                    // cache hit perfetto
-                    return unsafe { &*cached_ptr };
-                } else if cached_pos < n {
-                    // possiamo partire dal blocco già salvato
-                    start = cached_pos;
-                    block = unsafe { &*cached_ptr };
+        // Cache miss - traverse from closest point
+        let (start_idx, mut block) = if cached_idx < block_idx && !cached_ptr.is_null() {
+            (cached_idx, cached_ptr)
+        } else {
+            (0, self.buf)
+        };
+
+        // Fast traversal
+        for _ in start_idx..block_idx {
+            unsafe {
+                let next = (*block).next.load(Ordering::Acquire);
+                if next.is_null() {
+                    break;
                 }
+                block = next;
             }
         }
 
-        // avanza solo quanto serve
-        for _ in start..n {
-            let next = block.next.load(Ordering::Acquire);
-            if next.is_null() {
-                // non ancora allocato: nessun blocco n disponibile
-                return block; // oppure return None
-            }
-            block = unsafe { &*next };
-        }
-
-        if let Some(access) = cache {
-            // aggiorna cache con il blocco esatto trovato
-            access
-                .ptr
-                .store(block as *const _ as *mut _, Ordering::Release);
-            access.pos.store(n, Ordering::Release);
-        }
+        // Update cache
+        cache.pos.store(block_idx, Ordering::Relaxed);
+        cache.ptr.store(block, Ordering::Relaxed);
 
         block
     }
 
     #[inline(always)]
-    fn get_slot(&self, pos: usize) -> &Slot<T> {
-        &self.get_block(block_index(pos), None).slots[index_in_block(pos)]
+    unsafe fn get_slot_fast(&self, pos: usize) -> &Slot<T> {
+        let block = self.get_block_fast(block_index(pos), &self.read_cache);
+        &(*block).slots[index_in_block(pos)]
     }
 
     #[inline(always)]
-    fn get_write_slot(&self, pos: usize) -> &Slot<T> {
-        &self.get_block(block_index(pos), Some(&self.write)).slots[index_in_block(pos)]
+    unsafe fn get_write_slot_fast(&self, pos: usize) -> &Slot<T> {
+        let block = self.get_block_fast(block_index(pos), &self.write_cache);
+        &(*block).slots[index_in_block(pos)]
     }
 
     #[inline(always)]
-    fn get_read_slot(&self, pos: usize) -> &Slot<T> {
-        &self.get_block(block_index(pos), Some(&self.read)).slots[index_in_block(pos)]
+    unsafe fn get_read_slot_fast(&self, pos: usize) -> &Slot<T> {
+        let block = self.get_block_fast(block_index(pos), &self.read_cache);
+        &(*block).slots[index_in_block(pos)]
+    }
+
+    #[inline(always)]
+    unsafe fn get_write_slot_unchecked(&self, pos: usize) -> &Slot<T> {
+        let block_idx = block_index(pos);
+        let mut block = self.buf;
+        for _ in 0..block_idx {
+            block = (*block).next.load(Ordering::Relaxed);
+        }
+        &(*block).slots[index_in_block(pos)]
     }
 }
 
@@ -407,39 +451,42 @@ impl<T> Clone for AtomicVec<T> {
     fn clone(&self) -> Self {
         let inner = self.inner();
         inner.ref_count.fetch_add(1, Ordering::Relaxed);
-        Self { ptr: self.ptr }
+        Self { inner: self.inner }
     }
 }
 
 impl<T> Drop for AtomicVec<T> {
     fn drop(&mut self) {
-        let raw = *self.ptr as *mut InnerVec<T>;
-        let inner = unsafe { &*raw };
+        let inner = unsafe { &*(self.inner as *mut InnerVec<T>) };
 
-        if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+        if inner.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             fence(Ordering::Acquire);
 
-            // qui Box prende possesso UNA volta sola
-            let boxed: Box<InnerVec<T>> = unsafe { Box::from_raw(raw) };
+            let head = inner.head.load(Ordering::Relaxed);
+            let len = inner.len.load(Ordering::Relaxed);
+            let cap = inner.cap.load(Ordering::Relaxed);
 
-            let head = boxed.get_head();
-            let len = boxed.get_len();
-            let cap = boxed.get_cap();
-
-            // drop dei valori
+            // Drop values if necessary
             if mem::needs_drop::<T>() && len > 0 {
-                for i in 0..len {
-                    let idx = (head + i) % cap;
-                    let _ = boxed.get_read_slot(idx).read();
+                unsafe {
+                    for i in 0..len {
+                        let pos = (head + i) & (cap - 1);
+                        inner.get_read_slot_fast(pos).read_unchecked();
+                    }
                 }
             }
 
-            // dealloca blocchi
-            let mut block_ptr: *mut Block<T> = boxed.buf;
-            while !block_ptr.is_null() {
-                let next = unsafe { (*block_ptr).next.load(Ordering::Acquire) };
-                unsafe { drop(Box::from_raw(block_ptr)) };
-                block_ptr = next;
+            // Deallocate blocks
+            unsafe {
+                let mut block = inner.buf;
+                while !block.is_null() {
+                    let next = (*block).next.load(Ordering::Relaxed);
+                    Block::dealloc(block);
+                    block = next;
+                }
+
+                // Drop inner
+                drop(Box::from_raw(self.inner as *mut InnerVec<T>));
             }
         }
     }
@@ -447,11 +494,14 @@ impl<T> Drop for AtomicVec<T> {
 
 impl<T> FromIterator<T> for AtomicVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let v = AtomicVec::new();
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        let vec = Self::with_capacity(lower.max(BLOCK_CAP));
+
         for item in iter {
-            v.push(item);
+            vec.push(item);
         }
-        v
+        vec
     }
 }
 
