@@ -12,7 +12,7 @@ const BLOCK_CAP: usize = 32;
 
 const AVAILABLE: usize = 1;
 const BUSY: usize = 2;
-const DESTROY: usize = 4;
+
 
 /// Simple slot - exactly like original but optimized
 struct Slot<T> {
@@ -82,7 +82,8 @@ struct Position<T> {
 struct InnerVec<T> {
     buf: *mut Block<T>,
     buf_tail: CachePadded<AtomicPtr<Block<T>>>,
-    position: CachePadded<Position<T>>,
+    read: CachePadded<Position<T>>,
+    write: CachePadded<Position<T>>,
     head: CachePadded<AtomicUsize>,
     len: CachePadded<AtomicUsize>,
     cap: CachePadded<AtomicUsize>,
@@ -114,7 +115,7 @@ impl<T> AtomicVec<T> {
         // Simple sequential fill - no locks needed
         for i in 0..cap {
             inner.maybe_add_block();
-            inner.get_slot(i).write(initializer());
+            inner.get_write_slot(i).write(initializer());
         }
 
         inner.set_head(0);
@@ -155,7 +156,7 @@ impl<T> AtomicVec<T> {
         // Write directly - no additional synchronization needed
         let write_pos = (head + len) % inner.get_cap();
 
-        inner.get_slot(write_pos).write(value);
+        inner.get_write_slot(write_pos).write(value);
     }
 
     /// Pop - minimal overhead version
@@ -182,7 +183,7 @@ impl<T> AtomicVec<T> {
 
         // Read the value
         let head = inner.get_head();
-        let value = inner.get_slot(head).read();
+        let value = inner.get_read_slot(head).read();
 
         // Update head
         if current_len == 1 {
@@ -222,7 +223,7 @@ impl<T> AtomicVec<T> {
         // Fill with new values
         for i in 0..new_cap {
             inner.maybe_add_block();
-            inner.get_slot(i).write(initializer());
+            inner.get_write_slot(i).write(initializer());
         }
 
         inner.len.store(new_cap, Ordering::Release);
@@ -240,7 +241,7 @@ impl<T> AtomicVec<T> {
 
         for i in 0..len {
             let pos = (head + i) % cap;
-            out.push(inner.get_slot(pos).read());
+            out.push(inner.get_read_slot(pos).read());
         }
 
         // Reset to empty
@@ -259,7 +260,11 @@ impl<T> InnerVec<T> {
             buf: ptr,
             buf_tail: CachePadded::new(AtomicPtr::new(ptr)),
             head: CachePadded::new(AtomicUsize::new(0)),
-            position: CachePadded::new(Position {
+            read: CachePadded::new(Position {
+                pos: AtomicUsize::new(0),
+                ptr: AtomicPtr::new(ptr),
+            }),
+            write: CachePadded::new(Position {
                 pos: AtomicUsize::new(0),
                 ptr: AtomicPtr::new(ptr),
             }),
@@ -330,23 +335,25 @@ impl<T> InnerVec<T> {
         self.state.store(AVAILABLE, Ordering::Release);
     }
 
-    //#[inline(always)]
-    fn get_block(&self, n: usize) -> &Block<T> {
+    #[inline]
+    fn get_block(&self, n: usize, cache: Option<&Position<T>>) -> &Block<T> {
         // cache attuale
         let mut block = unsafe { &*self.buf };
         let mut start = 0;
 
-        let cached_ptr = self.position.ptr.load(Ordering::Acquire);
-        if !cached_ptr.is_null() {
-            let cached_pos = self.position.pos.load(Ordering::Acquire);
+        if let Some(access) = cache {
+            let cached_ptr = access.ptr.load(Ordering::Acquire);
+            if !cached_ptr.is_null() {
+                let cached_pos = access.pos.load(Ordering::Acquire);
 
-            if cached_pos == n {
-                // cache hit perfetto
-                return unsafe { &*cached_ptr };
-            } else if cached_pos < n {
-                // possiamo partire dal blocco già salvato
-                start = cached_pos;
-                block = unsafe { &*cached_ptr };
+                if cached_pos == n {
+                    // cache hit perfetto
+                    return unsafe { &*cached_ptr };
+                } else if cached_pos < n {
+                    // possiamo partire dal blocco già salvato
+                    start = cached_pos;
+                    block = unsafe { &*cached_ptr };
+                }
             }
         }
 
@@ -360,18 +367,30 @@ impl<T> InnerVec<T> {
             block = unsafe { &*next };
         }
 
-        // aggiorna cache con il blocco esatto trovato
-        self.position
-            .ptr
-            .store(block as *const _ as *mut _, Ordering::Release);
-        self.position.pos.store(n, Ordering::Release);
+        if let Some(access) = cache {
+            // aggiorna cache con il blocco esatto trovato
+            access
+                .ptr
+                .store(block as *const _ as *mut _, Ordering::Release);
+            access.pos.store(n, Ordering::Release);
+        }
 
         block
     }
 
     #[inline(always)]
     fn get_slot(&self, pos: usize) -> &Slot<T> {
-        &self.get_block(block_index(pos)).slots[index_in_block(pos)]
+        &self.get_block(block_index(pos), None).slots[index_in_block(pos)]
+    }
+
+    #[inline(always)]
+    fn get_write_slot(&self, pos: usize) -> &Slot<T> {
+        &self.get_block(block_index(pos), Some(&self.write)).slots[index_in_block(pos)]
+    }
+
+    #[inline(always)]
+    fn get_read_slot(&self, pos: usize) -> &Slot<T> {
+        &self.get_block(block_index(pos), Some(&self.read)).slots[index_in_block(pos)]
     }
 }
 
@@ -401,7 +420,7 @@ impl<T> Drop for AtomicVec<T> {
             fence(Ordering::Acquire);
 
             // qui Box prende possesso UNA volta sola
-            let mut boxed: Box<InnerVec<T>> = unsafe { Box::from_raw(raw) };
+            let boxed: Box<InnerVec<T>> = unsafe { Box::from_raw(raw) };
 
             let head = boxed.get_head();
             let len = boxed.get_len();
@@ -411,7 +430,7 @@ impl<T> Drop for AtomicVec<T> {
             if mem::needs_drop::<T>() && len > 0 {
                 for i in 0..len {
                     let idx = (head + i) % cap;
-                    let _ = boxed.get_slot(idx).read();
+                    let _ = boxed.get_read_slot(idx).read();
                 }
             }
 
