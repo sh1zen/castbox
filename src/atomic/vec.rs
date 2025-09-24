@@ -1,19 +1,22 @@
-use crate::mutex::{Mutex, WatchGuardRef};
+use crate::mutex::{Backoff, Mutex, WatchGuardRef};
 use crossbeam_utils::CachePadded;
-use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
+use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 
 /// Block capacity - same as original
 const BLOCK_CAP: usize = 32;
 
+const AVAILABLE: usize = 1;
+const BUSY: usize = 2;
+const DESTROY: usize = 4;
+
 /// Simple slot - exactly like original but optimized
 struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
-    // lock: Mutex,
 }
 
 impl<T> Slot<T> {
@@ -37,7 +40,7 @@ impl<T> Slot<T> {
 
 /// Block exactly like original
 struct Block<T> {
-    next: AtomicPtr<Block<T>>,
+    next: CachePadded<AtomicPtr<Block<T>>>,
     slots: [Slot<T>; BLOCK_CAP],
 }
 
@@ -77,13 +80,14 @@ struct Position<T> {
 
 /// Inner structure - simplified from original
 struct InnerVec<T> {
-    buf: Box<Block<T>>,
+    buf: *mut Block<T>,
     buf_tail: CachePadded<AtomicPtr<Block<T>>>,
-    c: CachePadded<Position<T>>,
+    position: CachePadded<Position<T>>,
     head: CachePadded<AtomicUsize>,
     len: CachePadded<AtomicUsize>,
     cap: CachePadded<AtomicUsize>,
     ref_count: CachePadded<AtomicUsize>,
+    state: CachePadded<AtomicUsize>,
 }
 
 /// AtomicVec - back to basics but optimized
@@ -252,16 +256,17 @@ impl<T> InnerVec<T> {
         let ptr = Box::into_raw(b);
 
         Self {
-            buf: unsafe { Box::from_raw(ptr) },
+            buf: ptr,
             buf_tail: CachePadded::new(AtomicPtr::new(ptr)),
             head: CachePadded::new(AtomicUsize::new(0)),
-            c: CachePadded::new(Position {
+            position: CachePadded::new(Position {
                 pos: AtomicUsize::new(0),
                 ptr: AtomicPtr::new(ptr),
             }),
             len: CachePadded::new(AtomicUsize::new(0)),
             cap: CachePadded::new(AtomicUsize::new(BLOCK_CAP)),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
+            state: CachePadded::new(AtomicUsize::new(AVAILABLE)),
         }
     }
 
@@ -296,30 +301,44 @@ impl<T> InnerVec<T> {
             return;
         }
 
+        let backoff = Backoff::new();
+        loop {
+            if self
+                .state
+                .compare_exchange(AVAILABLE, BUSY, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                if self.get_len() < self.get_cap() {
+                    self.state.store(AVAILABLE, Ordering::Release);
+                    return;
+                }
+                break;
+            }
+            backoff.snooze();
+        }
+
         let new_block = Box::into_raw(Block::new());
 
         let block = self.buf_tail.swap(new_block, Ordering::Acquire);
 
         self.cap.fetch_add(BLOCK_CAP, Ordering::Release);
 
-        if block.is_null() {
-            panic!("must not be null")
-        }
-
         let block = unsafe { &*block };
 
         block.next.store(new_block, Ordering::Release);
+
+        self.state.store(AVAILABLE, Ordering::Release);
     }
 
     //#[inline(always)]
     fn get_block(&self, n: usize) -> &Block<T> {
         // cache attuale
-        let mut block = &*self.buf;
+        let mut block = unsafe { &*self.buf };
         let mut start = 0;
 
-        let cached_ptr = self.c.ptr.load(Ordering::Acquire);
+        let cached_ptr = self.position.ptr.load(Ordering::Acquire);
         if !cached_ptr.is_null() {
-            let cached_pos = self.c.pos.load(Ordering::Acquire);
+            let cached_pos = self.position.pos.load(Ordering::Acquire);
 
             if cached_pos == n {
                 // cache hit perfetto
@@ -342,8 +361,10 @@ impl<T> InnerVec<T> {
         }
 
         // aggiorna cache con il blocco esatto trovato
-        self.c.ptr.store(block as *const _ as *mut _, Ordering::Release);
-        self.c.pos.store(n, Ordering::Release);
+        self.position
+            .ptr
+            .store(block as *const _ as *mut _, Ordering::Release);
+        self.position.pos.store(n, Ordering::Release);
 
         block
     }
@@ -373,32 +394,33 @@ impl<T> Clone for AtomicVec<T> {
 
 impl<T> Drop for AtomicVec<T> {
     fn drop(&mut self) {
-        let inner = self.inner();
+        let raw = *self.ptr as *mut InnerVec<T>;
+        let inner = unsafe { &*raw };
+
         if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
             fence(Ordering::Acquire);
 
-            unsafe {
-                let boxed: Box<InnerVec<T>> = Box::from_raw(*self.ptr as *mut InnerVec<T>);
+            // qui Box prende possesso UNA volta sola
+            let mut boxed: Box<InnerVec<T>> = unsafe { Box::from_raw(raw) };
 
-                let head = boxed.get_head();
-                let len = boxed.get_len();
-                let cap = boxed.get_cap();
+            let head = boxed.get_head();
+            let len = boxed.get_len();
+            let cap = boxed.get_cap();
 
-                // Drop elements
-                if mem::needs_drop::<T>() && len > 0 {
-                    for i in 0..len {
-                        let idx = (head + i) % cap;
-                        let _ = boxed.get_slot(idx).read(); // This drops the value
-                    }
+            // drop dei valori
+            if mem::needs_drop::<T>() && len > 0 {
+                for i in 0..len {
+                    let idx = (head + i) % cap;
+                    let _ = boxed.get_slot(idx).read();
                 }
+            }
 
-                // Deallocate blocks
-                let mut block_ptr: *mut Block<T> = Box::into_raw(boxed.buf);
-                while !block_ptr.is_null() {
-                    let next = (*block_ptr).next.load(Ordering::Acquire);
-                    drop(Box::from_raw(block_ptr));
-                    block_ptr = next;
-                }
+            // dealloca blocchi
+            let mut block_ptr: *mut Block<T> = boxed.buf;
+            while !block_ptr.is_null() {
+                let next = unsafe { (*block_ptr).next.load(Ordering::Acquire) };
+                unsafe { drop(Box::from_raw(block_ptr)) };
+                block_ptr = next;
             }
         }
     }
