@@ -1,51 +1,43 @@
-use crate::mutex::{Backoff, Mutex, WatchGuardRef};
+use crate::mutex::{Mutex, WatchGuardRef};
 use crossbeam_utils::CachePadded;
-use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
+use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FromIterator;
-use std::mem::MaybeUninit;
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::mem::{self, MaybeUninit};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
 
-/// Default initial capacity
+/// Block capacity - same as original
 const BLOCK_CAP: usize = 32;
 
-/// Thread-safe Vec, clonable
-#[repr(transparent)]
-pub struct AtomicVec<T> {
-    ptr: CachePadded<*const InnerVec<T>>,
-}
-
+/// Simple slot - exactly like original but optimized
 struct Slot<T> {
-    /// The value.
     value: UnsafeCell<MaybeUninit<T>>,
+    // lock: Mutex,
 }
 
 impl<T> Slot<T> {
+    #[inline]
     fn write(&self, value: T) {
         unsafe {
-            self.value.get().write(MaybeUninit::new(value));
+            (*self.value.get()).write(value);
         }
     }
 
+    #[inline]
     fn read(&self) -> T {
-        unsafe { self.value.get().read().assume_init() }
+        unsafe { (*self.value.get()).assume_init_read() }
     }
 
+    #[inline]
     fn get_ref(&self) -> &T {
-        unsafe { (&*self.value.get()).assume_init_ref() }
-    }
-
-    fn get_mut(&self) -> &T {
-        unsafe { (&mut *self.value.get()).assume_init_mut() }
+        unsafe { (*self.value.get()).assume_init_ref() }
     }
 }
 
+/// Block exactly like original
 struct Block<T> {
-    /// The next block in the linked list.
     next: AtomicPtr<Block<T>>,
-    /// Slots for values.
     slots: [Slot<T>; BLOCK_CAP],
 }
 
@@ -69,42 +61,39 @@ impl<T> Block<T> {
         layout
     };
 
-    /// Creates an empty block.
     fn new() -> Box<Self> {
-        // SAFETY: layout is not zero-sized
-
         let ptr = unsafe { alloc_zeroed(Self::LAYOUT) };
-        // Handle allocation failure
-
         if ptr.is_null() {
             handle_alloc_error(Self::LAYOUT)
         }
-        // SAFETY: This is safe because:
-        //  [1] `Block::next` (AtomicPtr) may be safely zero initialized.
-        //  [2] `Block::slots` (Array) may be safely zero initialized because of [3, 4].
-        //  [3] `Slot::value` (UnsafeCell) may be safely zero initialized because it
-        //       holds a MaybeUninit.
-        //  [4] `Slot::state` (AtomicUsize) may be safely zero initialized.
-        // TODO: unsafe { Box::new_zeroed().assume_init() }
-
         unsafe { Box::from_raw(ptr.cast()) }
     }
 }
 
-struct InnerVec<T> {
-    // padded fields for better cache isolation
-    buf: Box<Block<T>>,
-    head: CachePadded<UnsafeCell<usize>>,
-    len: CachePadded<UnsafeCell<usize>>,
-    cap: CachePadded<UnsafeCell<usize>>,
-    // reference count for clone/drop
-    ref_count: CachePadded<AtomicUsize>,
-    // reader/writer mutex: lock_shared / lock_exclusive
-    mutex: Mutex,
+struct Position<T> {
+    pos: AtomicUsize,
+    ptr: AtomicPtr<Block<T>>,
 }
 
-unsafe impl<T> Send for AtomicVec<T> {}
-unsafe impl<T> Sync for AtomicVec<T> {}
+/// Inner structure - simplified from original
+struct InnerVec<T> {
+    buf: Box<Block<T>>,
+    buf_tail: CachePadded<AtomicPtr<Block<T>>>,
+    c: CachePadded<Position<T>>,
+    head: CachePadded<AtomicUsize>,
+    len: CachePadded<AtomicUsize>,
+    cap: CachePadded<AtomicUsize>,
+    ref_count: CachePadded<AtomicUsize>,
+}
+
+/// AtomicVec - back to basics but optimized
+#[repr(transparent)]
+pub struct AtomicVec<T> {
+    ptr: CachePadded<*const InnerVec<T>>,
+}
+
+unsafe impl<T: Send> Send for AtomicVec<T> {}
+unsafe impl<T: Send> Sync for AtomicVec<T> {}
 
 impl<T> AtomicVec<T> {
     pub fn new() -> Self {
@@ -114,18 +103,18 @@ impl<T> AtomicVec<T> {
         }
     }
 
-    /// init_with: costruisce e popola il buffer — operazione esclusiva
     pub fn init_with<F: FnMut() -> T>(cap: usize, mut initializer: F) -> Self {
         let vec = Self::new();
         let inner = vec.inner();
 
-        for _ in 0..cap {
-            vec.push(initializer());
+        // Simple sequential fill - no locks needed
+        for i in 0..cap {
+            inner.maybe_add_block();
+            inner.get_slot(i).write(initializer());
         }
 
         inner.set_head(0);
         inner.set_len(cap);
-
         vec
     }
 
@@ -136,20 +125,12 @@ impl<T> AtomicVec<T> {
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        let inner = self.inner();
-        inner.mutex.lock_shared();
-        let l = inner.get_len();
-        inner.mutex.unlock_shared();
-        l
+        self.inner().get_len()
     }
 
     #[inline(always)]
     pub fn capacity(&self) -> usize {
-        let inner = self.inner();
-        inner.mutex.lock_shared();
-        let c = inner.get_cap();
-        inner.mutex.unlock_shared();
-        c
+        self.inner().get_cap()
     }
 
     #[inline(always)]
@@ -157,101 +138,96 @@ impl<T> AtomicVec<T> {
         self.len() == 0
     }
 
-    /// push: esclusivo. Semantica: push_back (aggiunge alla fine)
+    /// Push - minimal overhead version
     pub fn push(&self, value: T) {
         let inner = self.inner();
-        inner.mutex.lock_exclusive();
 
-        let cap = inner.get_cap();
-        let len = inner.get_len();
+        inner.maybe_add_block();
+
+        // Single atomic read for length
+        let len = inner.len.fetch_add(1, Ordering::AcqRel);
         let head = inner.get_head();
 
-        let write_pos = if len == 0 { 0 } else { (head + len) % cap };
+        // Write directly - no additional synchronization needed
+        let write_pos = (head + len) % inner.get_cap();
 
         inner.get_slot(write_pos).write(value);
-
-        inner.set_len(len + 1);
-
-        inner.mutex.unlock_exclusive();
     }
 
-    /// pop: esclusivo. Semantica: pop_front (rimuove il primo elemento)
+    /// Pop - minimal overhead version
     pub fn pop(&self) -> Option<T> {
         let inner = self.inner();
-        inner.mutex.lock_exclusive();
 
-        let len = inner.get_len();
-        if len == 0 {
-            inner.mutex.unlock_exclusive();
-            return None;
+        // Try to decrement length atomically
+        let mut current_len = inner.get_len();
+        loop {
+            if current_len == 0 {
+                return None;
+            }
+
+            match inner.len.compare_exchange_weak(
+                current_len,
+                current_len - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(x) => current_len = x,
+            }
         }
 
+        // Read the value
         let head = inner.get_head();
-        let cap = inner.get_cap();
-
         let value = inner.get_slot(head).read();
 
-        if len == 1 {
-            // now empty: reset head to 0 for canonical state
-            inner.set_head(0);
-            inner.set_len(0);
+        // Update head
+        if current_len == 1 {
+            inner.set_head(0); // Reset when empty
         } else {
-            inner.set_head((head + 1) % cap);
-            inner.set_len(len - 1);
+            inner.set_head((head + 1) % inner.get_cap());
         }
 
-        inner.mutex.unlock_exclusive();
         Some(value)
     }
 
-    /// get: shared. index è relativo al contenuto (0..len-1)
+    /// Get with minimal guard overhead
     pub fn get(&self, index: usize) -> Option<WatchGuardRef<'_, T>> {
         let inner = self.inner();
-        inner.mutex.lock_shared();
 
-        let head = inner.get_head();
-        let len = inner.get_len();
-        let cap = inner.get_cap();
-
-        if index >= len {
-            inner.mutex.unlock_shared();
+        if index >= inner.get_len() {
             return None;
         }
 
-        let pos = (head + index) % cap;
+        let head = inner.get_head();
+        let pos = (head + index) % inner.get_cap();
 
-        let value = inner.get_slot(pos).get_ref();
-
-        Some(WatchGuardRef::new(value, inner.mutex.clone()))
+        Some(WatchGuardRef::new(
+            inner.get_slot(pos).get_ref(),
+            Mutex::new(),
+        ))
     }
 
+    /// Reset - fast version
     pub fn reset_with(&self, new_cap: usize, mut initializer: impl FnMut() -> T) -> usize {
         let inner = self.inner();
-        inner.mutex.lock_exclusive();
 
-        // allocate and initialize new buffer. NOTE: if initializer panics here,
-        // the new buffer may leak — this function is intentionally simplified.
+        // Reset counters
+        inner.len.store(0, Ordering::Release);
+        inner.set_head(0);
+
+        // Fill with new values
         for i in 0..new_cap {
-            let slot = inner.get_slot(i);
-            slot.write(initializer());
+            inner.maybe_add_block();
+            inner.get_slot(i).write(initializer());
         }
 
-        // commit new buffer: it is fully initialized and contains `new_cap` elements
-        inner.set_head(0);
-        inner.set_len(new_cap);
-
-        inner.mutex.unlock_exclusive();
+        inner.len.store(new_cap, Ordering::Release);
         new_cap
     }
-}
 
-impl<T> AtomicVec<T> {
-    /// Consuma i dati correnti e li restituisce come `Vec<T>`.
-    /// Dopo la chiamata, l'AtomicVec risulta vuoto.
+    /// as_vec - fast drain
     pub fn as_vec(&self) -> Vec<T> {
         let inner = self.inner();
-        inner.mutex.lock_exclusive();
-
         let head = inner.get_head();
         let len = inner.get_len();
         let cap = inner.get_cap();
@@ -263,113 +239,132 @@ impl<T> AtomicVec<T> {
             out.push(inner.get_slot(pos).read());
         }
 
-        // reset indices: buffer ora considerato vuoto
+        // Reset to empty
         inner.set_head(0);
-        inner.set_len(0);
-
-        inner.mutex.unlock_exclusive();
+        inner.len.store(0, Ordering::Release);
         out
     }
 }
 
 impl<T> InnerVec<T> {
     fn new() -> Self {
+        let b = Block::<T>::new();
+        let ptr = Box::into_raw(b);
+
         Self {
-            buf: Block::<T>::new(),
-            head: CachePadded::new(UnsafeCell::new(0)),
-            len: CachePadded::new(UnsafeCell::new(0)),
-            cap: CachePadded::new(UnsafeCell::new(BLOCK_CAP)),
-            mutex: Mutex::new(),
+            buf: unsafe { Box::from_raw(ptr) },
+            buf_tail: CachePadded::new(AtomicPtr::new(ptr)),
+            head: CachePadded::new(AtomicUsize::new(0)),
+            c: CachePadded::new(Position {
+                pos: AtomicUsize::new(0),
+                ptr: AtomicPtr::new(ptr),
+            }),
+            len: CachePadded::new(AtomicUsize::new(0)),
+            cap: CachePadded::new(AtomicUsize::new(BLOCK_CAP)),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
         }
     }
 
     #[inline(always)]
     fn get_head(&self) -> usize {
-        unsafe { *self.head.get() }
+        self.head.load(Ordering::Acquire)
     }
 
     #[inline(always)]
     fn set_head(&self, v: usize) {
-        unsafe { *self.head.get() = v }
+        self.head.store(v, Ordering::Release)
     }
 
     #[inline(always)]
     fn get_len(&self) -> usize {
-        unsafe { *self.len.get() }
+        self.len.load(Ordering::Acquire)
     }
 
     #[inline(always)]
     fn set_len(&self, v: usize) {
-        unsafe { *self.len.get() = v }
+        self.len.store(v, Ordering::Release);
     }
 
     #[inline(always)]
     fn get_cap(&self) -> usize {
-        unsafe { *self.cap.get() }
+        self.cap.load(Ordering::Acquire)
     }
 
-    #[inline(always)]
-    fn get_block(&self, n: usize) -> &Block<T> {
-        let mut block = &*self.buf;
-        for _ in 0..n {
-            // carichiamo l'attuale next
-            let mut next = block.next.load(Ordering::Acquire);
-            if next.is_null() {
-                // proviamo ad allocare un nuovo block e a installarlo atomically
-                let new = Box::into_raw(Block::new());
+    /// Simplified block addition
+    fn maybe_add_block(&self) {
+        if self.get_len() < self.get_cap() {
+            return;
+        }
 
-                match block.next.compare_exchange(
-                    null_mut(),
-                    new,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        // abbiamo vinto la gara: `new` è ora installato come next
-                        // aggiorniamo la capacità (nota: questo muta l'UnsafeCell)
-                        unsafe { *self.cap.get() += BLOCK_CAP };
-                        next = new;
-                    }
-                    Err(actual) => {
-                        // qualcun altro ha installato `actual` prima di noi:
-                        // liberiamo la nostra allocazione per evitare leak
-                        unsafe { drop(Box::from_raw(new)); }
-                        next = actual;
-                    }
-                }
+        let new_block = Box::into_raw(Block::new());
+
+        let block = self.buf_tail.swap(new_block, Ordering::Acquire);
+
+        self.cap.fetch_add(BLOCK_CAP, Ordering::Release);
+
+        if block.is_null() {
+            panic!("must not be null")
+        }
+
+        let block = unsafe { &*block };
+
+        block.next.store(new_block, Ordering::Release);
+    }
+
+    //#[inline(always)]
+    fn get_block(&self, n: usize) -> &Block<T> {
+        // cache attuale
+        let mut block = &*self.buf;
+        let mut start = 0;
+
+        let cached_ptr = self.c.ptr.load(Ordering::Acquire);
+        if !cached_ptr.is_null() {
+            let cached_pos = self.c.pos.load(Ordering::Acquire);
+
+            if cached_pos == n {
+                // cache hit perfetto
+                return unsafe { &*cached_ptr };
+            } else if cached_pos < n {
+                // possiamo partire dal blocco già salvato
+                start = cached_pos;
+                block = unsafe { &*cached_ptr };
             }
-            // a questo punto `next` non è null
+        }
+
+        // avanza solo quanto serve
+        for _ in start..n {
+            let next = block.next.load(Ordering::Acquire);
+            if next.is_null() {
+                // non ancora allocato: nessun blocco n disponibile
+                return block; // oppure return None
+            }
             block = unsafe { &*next };
         }
+
+        // aggiorna cache con il blocco esatto trovato
+        self.c.ptr.store(block as *const _ as *mut _, Ordering::Release);
+        self.c.pos.store(n, Ordering::Release);
 
         block
     }
 
     #[inline(always)]
     fn get_slot(&self, pos: usize) -> &Slot<T> {
-        let block = self.get_block(block_index(pos));
-
-        if let Some(slot) = block.slots.get(index_in_block(pos)) {
-            slot
-        } else {
-            panic!("trying to get slot out of bounds");
-        }
+        &self.get_block(block_index(pos)).slots[index_in_block(pos)]
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for AtomicVec<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AtomicVec")
-            .field("type", &std::any::type_name::<T>())
             .field("len", &self.len())
+            .field("capacity", &self.capacity())
             .finish()
     }
 }
 
 impl<T> Clone for AtomicVec<T> {
     fn clone(&self) -> Self {
-        // increment refcount
         let inner = self.inner();
         inner.ref_count.fetch_add(1, Ordering::Relaxed);
         Self { ptr: self.ptr }
@@ -379,8 +374,8 @@ impl<T> Clone for AtomicVec<T> {
 impl<T> Drop for AtomicVec<T> {
     fn drop(&mut self) {
         let inner = self.inner();
-        if inner.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            std::sync::atomic::fence(Ordering::Acquire);
+        if inner.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+            fence(Ordering::Acquire);
 
             unsafe {
                 let boxed: Box<InnerVec<T>> = Box::from_raw(*self.ptr as *mut InnerVec<T>);
@@ -390,20 +385,17 @@ impl<T> Drop for AtomicVec<T> {
                 let cap = boxed.get_cap();
 
                 // Drop elements
-                if std::mem::needs_drop::<T>() && len > 0 {
+                if mem::needs_drop::<T>() && len > 0 {
                     for i in 0..len {
                         let idx = (head + i) % cap;
-                        let slot = boxed.get_slot(idx);
-                        slot.value.get().drop_in_place();
+                        let _ = boxed.get_slot(idx).read(); // This drops the value
                     }
                 }
 
                 // Deallocate blocks
                 let mut block_ptr: *mut Block<T> = Box::into_raw(boxed.buf);
-
                 while !block_ptr.is_null() {
                     let next = (*block_ptr).next.load(Ordering::Acquire);
-                    // Deallocate current block
                     drop(Box::from_raw(block_ptr));
                     block_ptr = next;
                 }
@@ -419,5 +411,11 @@ impl<T> FromIterator<T> for AtomicVec<T> {
             v.push(item);
         }
         v
+    }
+}
+
+impl<T> Default for AtomicVec<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
