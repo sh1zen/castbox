@@ -6,6 +6,34 @@ mod tests_atomic_vec {
     use std::time::Instant;
 
     #[test]
+    fn dfdsds() {
+        let x = AtomicVec::new();
+
+        x.push(0);
+        x.push(1);
+        x.push(2);
+        x.push(3);
+        assert_eq!(x.pop().unwrap(), 0);
+        assert_eq!(x.pop().unwrap(), 1);
+        x.push(4);
+        x.push(5);
+        x.push(6);
+        x.push(7);
+        assert_eq!(x.pop().unwrap(), 2);
+        assert_eq!(x.pop().unwrap(), 3);
+        assert_eq!(x.pop().unwrap(), 4);
+        assert_eq!(x.pop().unwrap(), 5);
+        assert_eq!(x.pop().unwrap(), 6);
+        assert_eq!(x.pop().unwrap(), 7);
+
+        x.push(8);
+        x.push(9);
+
+
+        assert_eq!(x.len(), 2);
+    }
+
+    #[test]
     fn stress_test() {
         let started = Instant::now();
         let vec = AtomicVec::new();

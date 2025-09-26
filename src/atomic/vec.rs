@@ -4,7 +4,7 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
-use std::process::exit;
+use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
 
 /// Block capacity - power of 2 for fast modulo with bitwise AND
@@ -40,17 +40,17 @@ impl<T> Slot<T> {
 impl<T> Slot<T> {
     #[inline(always)]
     unsafe fn write_unchecked(&self, value: T) {
-        (*self.value.get()).write(value);
+        unsafe { (*self.value.get()).write(value) };
     }
 
     #[inline(always)]
     unsafe fn read_unchecked(&self) -> T {
-        (*self.value.get()).assume_init_read()
+        unsafe { (*self.value.get()).assume_init_read() }
     }
 
     #[inline(always)]
     unsafe fn get_ref_unchecked(&self) -> &T {
-        (*self.value.get()).assume_init_ref()
+        unsafe { (*self.value.get()).assume_init_ref() }
     }
 }
 
@@ -109,7 +109,7 @@ struct InnerVec<T> {
     cap: AtomicUsize,  // Current capacity
 
     // Cold path fields
-    buf: *mut Block<T>,            // First block
+    buf: AtomicPtr<Block<T>>,      // First block
     buf_tail: AtomicPtr<Block<T>>, // Last block
     state: AtomicUsize,            // Allocation state
     ref_count: AtomicUsize,        // Reference counting
@@ -161,7 +161,10 @@ impl<T> AtomicVec<T> {
 
     #[inline(always)]
     pub fn capacity(&self) -> usize {
-        self.inner().cap.load(Ordering::Acquire)
+        let inner = self.inner();
+        (1 + block_index(inner.tail.load(Ordering::Acquire))
+            - block_index(inner.head.load(Ordering::Acquire)))
+            * BLOCK_CAP
     }
 
     #[inline(always)]
@@ -174,12 +177,11 @@ impl<T> AtomicVec<T> {
     pub fn push(&self, value: T) {
         let inner = self.inner();
 
-        // Fast path: get write position atomically
-        let write_pos = inner.tail.fetch_add(1, Ordering::Relaxed);
-
         // Check if we need more capacity
         inner.maybe_add_block();
 
+        // Fast path: get write position atomically
+        let write_pos = inner.tail.fetch_add(1, Ordering::Relaxed);
         let slot = inner.get_write_slot(write_pos);
 
         let backoff = Backoff::new();
@@ -205,15 +207,38 @@ impl<T> AtomicVec<T> {
     /// Ultra-optimized pop - minimal atomic operations
     #[inline]
     pub fn pop(&self) -> Option<T> {
-        // Fast length check
-        if self.is_empty() {
+        let inner = self.inner();
+
+        if inner.len() == 0 {
             return None;
         }
 
-        let inner = self.inner();
+        let mut read_pos = inner.head.fetch_add(1, Ordering::AcqRel);
 
-        // Get read position atomically
-        let read_pos = inner.head.fetch_add(1, Ordering::Release);
+        if read_pos > 0 && (read_pos & BLOCK_CAP_MASK) == 0 {
+            inner.wait_resize();
+
+            unsafe {
+                let old_head = inner.buf.load(Ordering::Acquire);
+                let new_head = (*old_head).next.load(Ordering::Acquire);
+
+                if !new_head.is_null() {
+                    inner.buf.store(new_head, Ordering::Release);
+
+                    let tail_block = inner.buf_tail.swap(old_head, Ordering::AcqRel);
+                    (*tail_block).next.store(old_head, Ordering::Release);
+
+                    (*old_head).next.store(null_mut(), Ordering::Release);
+                }
+            }
+
+            inner.head.store(1, Ordering::Release);
+            inner.tail.fetch_sub(BLOCK_CAP, Ordering::Release);
+            inner.read_cache.ptr.store(null_mut(), Ordering::Release);
+            inner.write_cache.ptr.store(null_mut(), Ordering::Release);
+            read_pos = 0;
+            inner.release();
+        }
 
         let slot = inner.get_read_slot(read_pos);
         slot.wait_write();
@@ -235,13 +260,9 @@ impl<T> AtomicVec<T> {
             return None;
         }
 
-        let head = inner.head.load(Ordering::Acquire);
-        let cap = inner.cap.load(Ordering::Acquire);
-        let pos = (head + index) & (cap - 1); // Assume cap is power of 2
-
         unsafe {
             Some(WatchGuardRef::new(
-                inner.get_slot(pos).get_ref_unchecked(),
+                inner.get_read_slot(index).get_ref_unchecked(),
                 Mutex::new(),
             ))
         }
@@ -274,15 +295,13 @@ impl<T> AtomicVec<T> {
     pub fn as_vec(&self) -> Vec<T> {
         let inner = self.inner();
         let head = inner.head.load(Ordering::Acquire);
-        let len = self.len();
-        let cap = inner.cap.load(Ordering::Acquire);
+        let tail = inner.tail.load(Ordering::Acquire);
 
-        let mut out = Vec::with_capacity(len);
+        let mut out = Vec::with_capacity(self.len());
 
         unsafe {
-            for i in 0..len {
-                let pos = (head + i) & (cap - 1);
-                out.push(inner.get_read_slot(pos).read_unchecked());
+            for i in head..tail {
+                out.push(inner.get_read_slot(i).read_unchecked());
             }
         }
 
@@ -302,7 +321,7 @@ impl<T> InnerVec<T> {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
             cap: AtomicUsize::new(BLOCK_CAP),
-            buf: first_block,
+            buf: AtomicPtr::new(first_block),
             buf_tail: AtomicPtr::new(first_block),
             state: AtomicUsize::new(READY),
             ref_count: AtomicUsize::new(1),
@@ -319,49 +338,35 @@ impl<T> InnerVec<T> {
 
     #[inline(always)]
     fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        let cap = self.cap.load(Ordering::Acquire);
-        (tail + cap - head) % cap
+        self.tail.load(Ordering::Acquire) - self.head.load(Ordering::Acquire)
     }
 
     /// Lock-free capacity expansion
     #[cold]
     fn maybe_add_block(&self) {
-        if self.len() < self.cap.load(Ordering::Acquire) {
+        let tail = self.tail.load(Ordering::Acquire);
+        if tail == 0 || (tail & BLOCK_CAP_MASK != 0) {
             return;
         }
 
-        let backoff = Backoff::new();
-        loop {
-            if self
-                .state
-                .compare_exchange(READY, WRITE, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                if self.len() < self.cap.load(Ordering::Acquire) {
-                    self.state.store(READY, Ordering::Release);
-                    return;
-                }
-                break;
-            }
-            backoff.snooze();
+        self.wait_resize();
+
+        let tail = self.tail.load(Ordering::Acquire);
+        if tail == 0 || (tail & BLOCK_CAP_MASK != 0) {
+            self.release();
+            return;
         }
 
         let new_block = Block::new();
 
-        let block = self.buf_tail.swap(new_block, Ordering::Acquire);
-
-        self.cap.fetch_add(BLOCK_CAP, Ordering::Release);
-        self.tail.store(
-            (self.tail.load(Ordering::Relaxed) + BLOCK_CAP_MASK) & !BLOCK_CAP_MASK,
-            Ordering::Relaxed,
-        );
-
-        let block = unsafe { &*block };
+        let block = unsafe { &*self.buf_tail.swap(new_block, Ordering::Acquire) };
 
         block.next.store(new_block, Ordering::Release);
 
+        self.release();
+    }
+
+    fn release(&self) {
         self.state.store(READY, Ordering::Release);
     }
 
@@ -395,7 +400,7 @@ impl<T> InnerVec<T> {
         let (start_idx, mut block) = if cached_idx < block_idx && !cached_ptr.is_null() {
             (cached_idx, cached_ptr)
         } else {
-            (0, self.buf)
+            (0, self.buf.load(Ordering::Acquire))
         };
 
         // Fast traversal
@@ -427,16 +432,13 @@ impl<T> InnerVec<T> {
         self.wait_resize();
 
         let block = self.get_block_fast(block_index(pos), &self.write_cache);
-        self.state.store(READY, Ordering::Release);
+        self.release();
         unsafe { &(*block).slots[index_in_block(pos)] }
     }
 
     #[inline(always)]
     fn get_read_slot(&self, pos: usize) -> &Slot<T> {
-        self.wait_resize();
-
         let block = self.get_block_fast(block_index(pos), &self.read_cache);
-        self.state.store(READY, Ordering::Release);
         unsafe { &(*block).slots[index_in_block(pos)] }
     }
 }
@@ -466,29 +468,27 @@ impl<T> Drop for AtomicVec<T> {
             fence(Ordering::Acquire);
 
             let head = inner.head.load(Ordering::Relaxed);
-            let len = inner.len();
-            let cap = inner.cap.load(Ordering::Relaxed);
+            let tail = inner.tail.load(Ordering::Relaxed);
 
-            // Drop values if necessary
-            if mem::needs_drop::<T>() && len > 0 {
+            // Drop dei valori se T ha bisogno di drop
+            if mem::needs_drop::<T>() && self.len() > 0 {
                 unsafe {
-                    for i in 0..len {
-                        let pos = (head + i) & (cap - 1);
-                        inner.get_read_slot(pos).read_unchecked();
+                    for i in head..tail {
+                        inner.get_read_slot(i).read_unchecked();
                     }
                 }
             }
 
-            // Deallocate blocks
+            // Deallocazione dei blocchi
             unsafe {
-                let mut block = inner.buf;
+                let mut block = inner.buf.load(Ordering::Acquire); // usa load su AtomicPtr
                 while !block.is_null() {
                     let next = (*block).next.load(Ordering::Relaxed);
                     Block::dealloc(block);
                     block = next;
                 }
 
-                // Drop inner
+                // Dealloca inner
                 drop(Box::from_raw(self.inner as *mut InnerVec<T>));
             }
         }

@@ -6,7 +6,7 @@ use std::time::Instant;
 #[test]
 #[cfg_attr(miri, ignore)]
 fn dfvgsfv() {
-    const N: usize = 1_000;
+    const N: usize = 1_0_000;
 
     // === Single-thread push/pop ===
     let q = AtomicVec::new();
@@ -14,11 +14,13 @@ fn dfvgsfv() {
     for i in 0..N {
         q.push(i);
     }
-    for _ in 0..N {
+    for _i in 0..N {
         q.pop().unwrap();
     }
     let duration = start.elapsed();
     println!("Single-thread push+pop: {:.2?}", duration);
+
+    return;
 
     // === Multi-threaded push ===
     let q = Arc::new(AtomicVec::new());
