@@ -6,6 +6,7 @@ use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
+use crossbeam_utils::CachePadded;
 
 /// Block capacity - power of 2 for fast modulo with bitwise AND
 const BLOCK_CAP: usize = 32;
@@ -19,7 +20,7 @@ const WRITE: usize = 2;
 struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
     /// The state of the slot.
-    state: AtomicUsize,
+    state: CachePadded<AtomicUsize>,
 }
 
 impl<T> Slot<T> {
@@ -40,24 +41,24 @@ impl<T> Slot<T> {
 impl<T> Slot<T> {
     #[inline(always)]
     unsafe fn write_unchecked(&self, value: T) {
-        unsafe { (*self.value.get()).write(value) };
+        (*self.value.get()).write(value);
     }
 
     #[inline(always)]
     unsafe fn read_unchecked(&self) -> T {
-        unsafe { (*self.value.get()).assume_init_read() }
+        (*self.value.get()).assume_init_read()
     }
 
     #[inline(always)]
     unsafe fn get_ref_unchecked(&self) -> &T {
-        unsafe { (*self.value.get()).assume_init_ref() }
+        (*self.value.get()).assume_init_ref()
     }
 }
 
 /// Optimized block with better memory layout
 #[repr(C)]
 struct Block<T> {
-    next: AtomicPtr<Block<T>>, // Remove CachePadded overhead
+    next: CachePadded<AtomicPtr<Block<T>>>, // evita false sharing
     slots: [Slot<T>; BLOCK_CAP],
 }
 
@@ -96,23 +97,22 @@ impl<T> Block<T> {
 /// Optimized position cache with better locality
 #[repr(C)]
 struct Position<T> {
-    pos: AtomicUsize,
-    ptr: AtomicPtr<Block<T>>,
+    pos: CachePadded<AtomicUsize>,
+    ptr: CachePadded<AtomicPtr<Block<T>>>,
 }
 
 /// Highly optimized inner structure - minimal atomic operations
 #[repr(C)]
 struct InnerVec<T> {
     // Hot path fields first for better cache locality
-    head: AtomicUsize, // Read position
-    tail: AtomicUsize, // Write position
-    cap: AtomicUsize,  // Current capacity
+    head: CachePadded<AtomicUsize>, // Read position
+    tail: CachePadded<AtomicUsize>, // Write position
 
     // Cold path fields
-    buf: AtomicPtr<Block<T>>,      // First block
-    buf_tail: AtomicPtr<Block<T>>, // Last block
-    state: AtomicUsize,            // Allocation state
-    ref_count: AtomicUsize,        // Reference counting
+    buf: CachePadded<AtomicPtr<Block<T>>>,      // First block
+    buf_tail: CachePadded<AtomicPtr<Block<T>>>, // Last block
+    state: CachePadded<AtomicUsize>,            // Allocation state
+    ref_count: CachePadded<AtomicUsize>,        // Reference counting
 
     // Position caches for block traversal optimization
     read_cache: Position<T>,
@@ -318,20 +318,19 @@ impl<T> InnerVec<T> {
         let first_block = Block::<T>::new();
 
         Self {
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            cap: AtomicUsize::new(BLOCK_CAP),
-            buf: AtomicPtr::new(first_block),
-            buf_tail: AtomicPtr::new(first_block),
-            state: AtomicUsize::new(READY),
-            ref_count: AtomicUsize::new(1),
+            head: CachePadded::new(AtomicUsize::new(0)),
+            tail: CachePadded::new(AtomicUsize::new(0)),
+            buf: CachePadded::new(AtomicPtr::new(first_block)),
+            buf_tail: CachePadded::new(AtomicPtr::new(first_block)),
+            state: CachePadded::new(AtomicUsize::new(READY)),
+            ref_count: CachePadded::new(AtomicUsize::new(1)),
             read_cache: Position {
-                pos: AtomicUsize::new(0),
-                ptr: AtomicPtr::new(first_block),
+                pos: CachePadded::new(AtomicUsize::new(0)),
+                ptr: CachePadded::new(AtomicPtr::new(first_block)),
             },
             write_cache: Position {
-                pos: AtomicUsize::new(0),
-                ptr: AtomicPtr::new(first_block),
+                pos: CachePadded::new(AtomicUsize::new(0)),
+                ptr: CachePadded::new(AtomicPtr::new(first_block)),
             },
         }
     }
@@ -481,7 +480,7 @@ impl<T> Drop for AtomicVec<T> {
 
             // Deallocazione dei blocchi
             unsafe {
-                let mut block = inner.buf.load(Ordering::Acquire); // usa load su AtomicPtr
+                let mut block = inner.buf.load(Ordering::Acquire);
                 while !block.is_null() {
                     let next = (*block).next.load(Ordering::Relaxed);
                     Block::dealloc(block);
