@@ -8,3 +8,4 @@ mod mutex;
 mod atomic_vec;
 mod bench;
 mod buffer;
+mod array;

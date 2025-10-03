@@ -11,9 +11,9 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 /// Number of shards (buckets)
-const NUM_SHARDS: usize = 4;
+const NUM_SHARDS: usize = 32;
 /// Default size of each shard's vector
-const DEFAULT_SHARD_SIZE: usize = 128;
+const DEFAULT_SHARD_SIZE: usize = 64;
 /// Load factor threshold for resizing
 const LOAD_FACTOR_THRESHOLD: f64 = 0.75;
 

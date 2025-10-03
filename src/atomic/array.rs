@@ -1,63 +1,83 @@
-use crate::mutex::{Backoff, Mutex, WatchGuardRef};
+use crate::mutex::{Backoff, Mutex, WatchGuardRef, WatchGuardMut};
 use crossbeam_utils::CachePadded;
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::iter::FromIterator;
 use std::mem::{self, MaybeUninit};
 use std::ptr;
-use std::sync::atomic::{fence, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicU32, AtomicUsize, Ordering};
 
-// Default array capacity
-const DEFAULT_ARRAY_CAP: usize = 64;
+/// Default capacity for the array
+const DEFAULT_ARRAY_CAP: usize = 32;
 
-// Slot state flags
-const WRITE: usize = 1; // slot has been written
-const READ: usize = 2; // slot has been read
+/// Slot state flags (using `u32` for reduced memory footprint and cache usage)
+const EMPTY: u32 = 0;
+const WRITE: u32 = 1;
+const READ: u32 = 2;
 
 /// Represents a single slot in the array.
-/// UnsafeCell allows interior mutability without borrowing restrictions.
-/// The state is atomic to allow concurrent access.
+/// Aligned to 64 bytes (cache line size on x86-64) to avoid false sharing.
+#[repr(align(64))]
 struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
-    state: AtomicUsize,
+    state: AtomicU32,
+    lock: Mutex,
 }
 
 impl<T> Slot<T> {
-    const fn new() -> Self {
+    /// Creates a new, empty slot.
+    #[inline(always)]
+    fn new() -> Self {
         Self {
             value: UnsafeCell::new(MaybeUninit::uninit()),
-            state: AtomicUsize::new(0),
+            state: AtomicU32::new(EMPTY),
+            lock: Mutex::new(),
         }
     }
 
+    /// Wait until the slot is written.
+    /// Optimized with fast-path and backoff-based spin wait.
     #[inline(always)]
     fn wait_write(&self) {
+        // Fast path: already written
+        if self.state.load(Ordering::Acquire) & WRITE != 0 {
+            return;
+        }
+
+        // Slow path with exponential backoff
         let backoff = Backoff::new();
-        // Wait until the slot is written by a producer
         while self.state.load(Ordering::Acquire) & WRITE == 0 {
             backoff.snooze();
         }
     }
 
-    #[inline]
+    /// Reset slot to EMPTY state.
+    #[inline(always)]
     fn reset(&self) {
-        self.state.store(0, Ordering::Relaxed);
+        self.state.store(EMPTY, Ordering::Relaxed);
+    }
+
+    /// Returns true if slot contains written data.
+    #[inline(always)]
+    fn is_written(&self) -> bool {
+        self.state.load(Ordering::Relaxed) & WRITE != 0
     }
 }
 
-/// The internal representation of the static array.
+/// Internal representation of the array.
+/// Uses padded atomics to avoid false sharing between threads.
 #[repr(C)]
 struct InnerArray<T> {
-    slots: *mut Slot<T>,                 // pointer to allocated slots
-    capacity: usize,                     // current capacity
-    head: CachePadded<AtomicUsize>,      // head index
-    tail: CachePadded<AtomicUsize>,      // tail index
-    len: CachePadded<AtomicUsize>,       // current length
-    ref_count: CachePadded<AtomicUsize>, // reference count for cloning
-    lock: CachePadded<AtomicUsize>,      // shared/exclusive lock
+    slots: *mut Slot<T>,
+    capacity: usize,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
+    len: CachePadded<AtomicUsize>,
+    ref_count: CachePadded<AtomicUsize>,
 }
 
-/// Thread-safe static array with atomic operations.
+/// Public, thread-safe atomic array.
+/// Wraps a raw pointer to the inner representation.
 #[repr(transparent)]
 pub struct AtomicArray<T> {
     inner: *const InnerArray<T>,
@@ -67,25 +87,28 @@ unsafe impl<T: Send> Send for AtomicArray<T> {}
 unsafe impl<T: Send> Sync for AtomicArray<T> {}
 
 impl<T> AtomicArray<T> {
-    /// Creates a new empty atomic array with default capacity.
+    /// Creates a new array with default capacity.
     #[inline]
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_ARRAY_CAP)
     }
 
-    /// Creates a new empty atomic array with specified capacity.
+    /// Creates a new array with the specified capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "Capacity must be greater than 0");
 
-        // Allocate slots array
-        let layout = std::alloc::Layout::array::<Slot<T>>(capacity)
-            .expect("Failed to create layout");
+        // Allocate slots array (cache-line aligned)
+        let layout = std::alloc::Layout::from_size_align(
+            capacity * mem::size_of::<Slot<T>>(),
+            mem::align_of::<Slot<T>>(),
+        ).expect("Failed to create layout");
+
         let slots = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout) as *mut Slot<T>;
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            // Initialize all slots
+            // Initialize slots in-place
             for i in 0..capacity {
                 ptr.add(i).write(Slot::new());
             }
@@ -99,7 +122,6 @@ impl<T> AtomicArray<T> {
             tail: CachePadded::new(AtomicUsize::new(0)),
             len: CachePadded::new(AtomicUsize::new(0)),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
-            lock: CachePadded::new(AtomicUsize::new(0)),
         };
 
         Self {
@@ -107,8 +129,7 @@ impl<T> AtomicArray<T> {
         }
     }
 
-    /// Initializes the array with a given capacity using a provided initializer.
-    /// Resizes the array if needed.
+    /// Create an array with given capacity and initialize with values produced by the initializer.
     pub fn init_with<F: FnMut() -> T>(cap: usize, mut initializer: F) -> Self {
         let arr = Self::with_capacity(cap);
         for _ in 0..cap {
@@ -122,100 +143,73 @@ impl<T> AtomicArray<T> {
         unsafe { &*self.inner }
     }
 
+    /// Returns the current number of stored elements.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.inner().len.load(Ordering::Acquire)
     }
 
+    /// Returns `true` if the array is empty.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Returns total capacity of the array.
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.inner().capacity
     }
 
-    /// Acquire a shared lock (readers) with backoff
-    #[inline(always)]
-    fn wait_lock_shared(&self) {
+    /// Push a new element into the array.
+    /// Optimized: lock-free fast path when no contention.
+    #[inline]
+    pub fn push(&self, value: T) -> Result<(), T> {
         let inner = self.inner();
-        let backoff = Backoff::new();
 
-        // increment readers by 2 (lowest bit reserved for exclusive lock)
-        let prev = inner.lock.fetch_add(2, Ordering::AcqRel);
-        if prev & 1 == 1 {
-            // Wait until exclusive lock is released
-            while inner.lock.load(Ordering::Acquire) & 1 == 1 {
-                backoff.snooze();
-            }
+        let tail = inner.tail.load(Ordering::Relaxed);
+        if tail >= inner.capacity {
+            return Err(value);
         }
+
+        // Fast CAS path
+        if inner.tail.compare_exchange(tail, tail + 1, Ordering::Release, Ordering::Acquire).is_ok() {
+            unsafe {
+                let slot = &*inner.slots.add(tail);
+                ptr::write(slot.value.get(), MaybeUninit::new(value));
+                slot.state.store(WRITE, Ordering::Release);
+                inner.len.fetch_add(1, Ordering::Release);
+            }
+            return Ok(());
+        }
+
+        // Contention → fallback
+        self.push_slow(value)
     }
 
-    /// Acquire an exclusive lock (writers) with backoff
-    #[inline(always)]
-    fn wait_lock_exclusive(&self) {
+    /// Slow path push with backoff.
+    #[cold]
+    fn push_slow(&self, value: T) -> Result<(), T> {
         let inner = self.inner();
         let backoff = Backoff::new();
+        let mut tail = inner.tail.load(Ordering::Relaxed);
 
         loop {
-            match inner
-                .lock
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => break, // success
-                Err(_) => backoff.snooze(),
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn release_lock_shared(&self) {
-        self.inner().lock.fetch_sub(2, Ordering::Release);
-    }
-
-    #[inline(always)]
-    fn release_lock_exclusive(&self) {
-        self.inner().lock.store(0, Ordering::Release);
-    }
-
-    /// Push a value without acquiring the shared lock.
-    /// Unsafe because concurrent access may occur if called externally.
-    /// Returns an error if the array is full.
-    pub unsafe fn push_unchecked(&self, value: T) -> Result<(), T> {
-        let inner = self.inner();
-        let backoff = Backoff::new();
-        let mut tail = inner.tail.load(Ordering::Acquire);
-
-        loop {
-            // Check if array is full
             if tail >= inner.capacity {
                 return Err(value);
             }
 
-            let new_tail = tail + 1;
-
-            // Atomically claim the next slot
-            match inner.tail.compare_exchange(
-                tail,
-                new_tail,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
+            match inner.tail.compare_exchange(tail, tail + 1, Ordering::Release, Ordering::Acquire) {
                 Ok(_) => {
-                    // Write the value to the slot
-                    let slot = &*inner.slots.add(tail);
-                    slot.value.get().write(MaybeUninit::new(value));
-                    // Publish the WRITE state to signal readers
-                    slot.state.store(WRITE, Ordering::Release);
-
-                    // Increment the vector length
-                    inner.len.fetch_add(1, Ordering::Release);
+                    unsafe {
+                        let slot = &*inner.slots.add(tail);
+                        ptr::write(slot.value.get(), MaybeUninit::new(value));
+                        slot.state.store(WRITE, Ordering::Release);
+                        inner.len.fetch_add(1, Ordering::Release);
+                    }
                     return Ok(());
                 }
                 Err(t) => {
-                    // CAS failed, reload tail and retry
                     tail = t;
                     backoff.snooze();
                 }
@@ -223,89 +217,126 @@ impl<T> AtomicArray<T> {
         }
     }
 
-    /// Thread-safe push with shared lock.
-    /// Returns an error if the array is full.
-    pub fn push(&self, value: T) -> Result<(), T> {
-        self.wait_lock_shared();
-        let result = unsafe { self.push_unchecked(value) };
-        self.release_lock_shared();
-        result
-    }
-
-    unsafe fn get_unchecked(&self, index: usize) -> Option<WatchGuardRef<'_, T>> {
+    /// Read-only access by index.
+    /// Returns a guarded reference with shared lock.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<WatchGuardRef<'_, T>> {
         let inner = self.inner();
-
-        if index >= self.len() {
+        let len = inner.len.load(Ordering::Acquire);
+        if index >= len {
             return None;
         }
 
         let head_idx = inner.head.load(Ordering::Acquire);
         let target = head_idx + index;
-
         if target >= inner.capacity {
             return None;
         }
 
-        let slot = &*inner.slots.add(target);
-        slot.wait_write();
-
-        Some(WatchGuardRef::new(
-            (*slot.value.get()).assume_init_ref(),
-            Mutex::new(),
-        ))
+        unsafe {
+            let slot = &*inner.slots.add(target);
+            slot.wait_write();
+            slot.lock.lock_shared();
+            Some(WatchGuardRef::new(
+                (*slot.value.get()).assume_init_ref(),
+                slot.lock.clone(),
+            ))
+        }
     }
 
-    /// Get a reference to the value at a specific index.
-    /// Returns a watch guard to allow safe concurrent access.
+    /// Mutable access by index.
+    /// Returns a guarded reference with exclusive lock.
     #[inline]
-    pub fn get(&self, index: usize) -> Option<WatchGuardRef<'_, T>> {
-        self.wait_lock_shared();
-        let val = unsafe { self.get_unchecked(index) };
-        self.release_lock_shared();
-        val
+    pub fn get_mut(&self, index: usize) -> Option<WatchGuardMut<'_, T>> {
+        let inner = self.inner();
+        let len = inner.len.load(Ordering::Acquire);
+        if index >= len {
+            return None;
+        }
+
+        let head_idx = inner.head.load(Ordering::Acquire);
+        let target = head_idx + index;
+        if target >= inner.capacity {
+            return None;
+        }
+
+        unsafe {
+            let slot = &*inner.slots.add(target);
+            slot.wait_write();
+            slot.lock.lock_exclusive();
+            Some(WatchGuardMut::new(
+                (*slot.value.get()).assume_init_mut(),
+                slot.lock.clone(),
+            ))
+        }
     }
 
-    /// Reset the array with new capacity and initialize using a provided initializer.
-    /// This will deallocate the old array and allocate a new one with the specified capacity.
-    pub fn reset_with(&self, new_cap: usize, mut initializer: impl FnMut() -> T) -> Result<usize, usize> {
+    /// Reset the array to a new capacity with freshly initialized values.
+    /// Ensures exclusive access to all slots before dropping.
+    pub fn reset_with(
+        &self,
+        new_cap: usize,
+        mut initializer: impl FnMut() -> T,
+    ) -> Result<usize, usize> {
         assert!(new_cap > 0, "Capacity must be greater than 0");
 
-        let inner = unsafe { &mut *(self.inner as *mut InnerArray<T>) };
-        self.wait_lock_exclusive();
+        let inner_ptr = self.inner as *mut InnerArray<T>;
+        let inner = unsafe { &mut *inner_ptr };
 
-        // Drop existing elements if needed
+        let old_capacity = inner.capacity;
+        let old_slots = inner.slots;
+
+        // Ensure exclusive locks on all slots
+        unsafe {
+            for i in 0..old_capacity {
+                let slot = &*old_slots.add(i);
+                if slot.is_written() {
+                    slot.wait_write();
+                    slot.lock.lock_exclusive();
+                }
+            }
+        }
+
+        // Drop old values if needed
         if mem::needs_drop::<T>() {
-            let len = inner.len.load(Ordering::Relaxed);
-            let head = inner.head.load(Ordering::Relaxed);
             unsafe {
-                for i in 0..len {
-                    let idx = head + i;
-                    if idx < inner.capacity {
-                        let slot = &*inner.slots.add(idx);
-                        if slot.state.load(Ordering::Relaxed) & WRITE != 0 {
-                            ptr::drop_in_place(slot.value.get());
-                        }
+                for i in 0..old_capacity {
+                    let slot = &*old_slots.add(i);
+                    if slot.is_written() {
+                        ptr::drop_in_place(slot.value.get());
                     }
                 }
             }
         }
 
-        // Deallocate old slots
+        // Unlock and deallocate old slots
         unsafe {
-            let old_layout = std::alloc::Layout::array::<Slot<T>>(inner.capacity)
-                .expect("Failed to create layout");
-            std::alloc::dealloc(inner.slots as *mut u8, old_layout);
+            for i in 0..old_capacity {
+                let slot = &*old_slots.add(i);
+                if slot.is_written() {
+                    slot.lock.unlock_exclusive();
+                }
+                ptr::drop_in_place(old_slots.add(i));
+            }
+
+            let old_layout = std::alloc::Layout::from_size_align(
+                old_capacity * mem::size_of::<Slot<T>>(),
+                mem::align_of::<Slot<T>>(),
+            ).expect("Failed to create layout");
+            std::alloc::dealloc(old_slots as *mut u8, old_layout);
         }
 
-        // Allocate new slots array
-        let layout = std::alloc::Layout::array::<Slot<T>>(new_cap)
-            .expect("Failed to create layout");
+        // Allocate new slots
+        let layout = std::alloc::Layout::from_size_align(
+            new_cap * mem::size_of::<Slot<T>>(),
+            mem::align_of::<Slot<T>>(),
+        ).expect("Failed to create layout");
+
         let slots = unsafe {
             let ptr = std::alloc::alloc_zeroed(layout) as *mut Slot<T>;
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            // Initialize all slots
             for i in 0..new_cap {
                 ptr.add(i).write(Slot::new());
             }
@@ -318,88 +349,168 @@ impl<T> AtomicArray<T> {
         inner.tail.store(0, Ordering::Relaxed);
         inner.len.store(0, Ordering::Relaxed);
 
-        unsafe {
-            for i in 0..new_cap {
-                if self.push_unchecked(initializer()).is_err() {
-                    self.release_lock_exclusive();
-                    return Err(i);
-                }
+        // Initialize new values
+        let inner_immut = unsafe { &*inner_ptr };
+        for i in 0..new_cap {
+            let value = initializer();
+            unsafe {
+                let slot = &*inner_immut.slots.add(i);
+                ptr::write(slot.value.get(), MaybeUninit::new(value));
+                slot.state.store(WRITE, Ordering::Release);
             }
+            inner_immut.tail.store(i + 1, Ordering::Relaxed);
+            inner_immut.len.store(i + 1, Ordering::Relaxed);
         }
 
-        self.release_lock_exclusive();
         Ok(new_cap)
     }
 
-    /// Convert the atomic array into a standard Vec<T>.
-    /// Consumes all elements, thread-safely.
+    /// Convert the array into a `Vec<T>` (requires `Clone`).
     pub fn as_vec(&self) -> Vec<T>
     where
         T: Clone,
     {
-        let mut out = Vec::with_capacity(self.len());
-        if self.is_empty() {
-            return out;
+        let len = self.len();
+        if len == 0 {
+            return Vec::new();
         }
 
-        self.wait_lock_shared();
-        for pos in 0..self.len() {
-            if let Some(guard) = unsafe { self.get_unchecked(pos) } {
-                out.push((*guard).clone());
+        let mut out = Vec::with_capacity(len);
+        let inner = self.inner();
+        let head = inner.head.load(Ordering::Acquire);
+
+        unsafe {
+            for i in 0..len {
+                let target = head + i;
+                if target < inner.capacity {
+                    let slot = &*inner.slots.add(target);
+                    slot.wait_write();
+                    let value = (*slot.value.get()).assume_init_ref().clone();
+                    out.push(value);
+                }
             }
         }
-        self.release_lock_shared();
+
         out
+    }
+
+    /// Apply function `f` to each element with shared access.
+    #[inline]
+    pub fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&T),
+    {
+        let inner = self.inner();
+        let len = inner.len.load(Ordering::Acquire);
+        let head = inner.head.load(Ordering::Acquire);
+
+        unsafe {
+            for i in 0..len {
+                let target = head + i;
+                if target < inner.capacity {
+                    let slot = &*inner.slots.add(target);
+                    slot.wait_write();
+                    slot.lock.lock_shared();
+                    f((*slot.value.get()).assume_init_ref());
+                    slot.lock.unlock_shared();
+                }
+            }
+        }
+    }
+
+    /// Apply function `f` to each element with exclusive mutable access.
+    #[inline]
+    pub fn for_each_mut<F>(&self, mut f: F)
+    where
+        F: FnMut(&mut T),
+    {
+        let inner = self.inner();
+        let len = inner.len.load(Ordering::Acquire);
+        let head = inner.head.load(Ordering::Acquire);
+
+        unsafe {
+            for i in 0..len {
+                let target = head + i;
+                if target < inner.capacity {
+                    let slot = &*inner.slots.add(target);
+                    slot.wait_write();
+                    slot.lock.lock_exclusive();
+                    f((*slot.value.get()).assume_init_mut());
+                    slot.lock.unlock_exclusive();
+                }
+            }
+        }
+    }
+
+    /// Split array indices into `num_chunks` for parallel processing.
+    #[inline]
+    pub fn chunk_indices(&self, num_chunks: usize) -> Vec<(usize, usize)> {
+        let len = self.len();
+        if len == 0 || num_chunks == 0 {
+            return vec![];
+        }
+
+        let chunk_size = (len + num_chunks - 1) / num_chunks;
+        let mut chunks = Vec::with_capacity(num_chunks);
+
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(len);
+            if start < len {
+                chunks.push((start, end));
+            }
+        }
+
+        chunks
     }
 }
 
 impl<T> Clone for AtomicArray<T> {
-    /// Cloning the AtomicArray only increases the reference count.
-    /// The underlying data is shared safely between clones.
+    #[inline]
     fn clone(&self) -> Self {
-        let inner = self.inner();
-        inner.ref_count.fetch_add(1, Ordering::Relaxed);
+        self.inner().ref_count.fetch_add(1, Ordering::Relaxed);
         Self { inner: self.inner }
     }
 }
 
 impl<T> Drop for AtomicArray<T> {
-    /// Drops the AtomicArray.
-    /// If this is the last reference, deallocates the inner structure.
     fn drop(&mut self) {
         let inner = unsafe { &*self.inner };
 
-        // Only deallocate if this is the last reference
         if inner.ref_count.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
+
         fence(Ordering::Acquire);
 
         unsafe {
-            // Drop all written elements if T needs drop
+            // Drop all values if needed
             if mem::needs_drop::<T>() {
                 for i in 0..inner.capacity {
                     let slot = &*inner.slots.add(i);
-                    if slot.state.load(Ordering::Relaxed) & WRITE != 0 {
+                    if slot.is_written() {
                         ptr::drop_in_place(slot.value.get());
                     }
                 }
             }
 
-            // Deallocate slots array
-            let layout = std::alloc::Layout::array::<Slot<T>>(inner.capacity)
-                .expect("Failed to create layout");
+            // Drop slots themselves
+            for i in 0..inner.capacity {
+                ptr::drop_in_place(inner.slots.add(i));
+            }
+
+            let layout = std::alloc::Layout::from_size_align(
+                inner.capacity * mem::size_of::<Slot<T>>(),
+                mem::align_of::<Slot<T>>(),
+            ).expect("Failed to create layout");
             std::alloc::dealloc(inner.slots as *mut u8, layout);
 
-            // Deallocate InnerArray itself
             drop(Box::from_raw(self.inner as *mut InnerArray<T>));
         }
     }
 }
 
 impl<T> FromIterator<T> for AtomicArray<T> {
-    /// Creates an AtomicArray from an iterator of items.
-    /// Allocates capacity based on size hint if available, otherwise uses default.
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let iter = iter.into_iter();
         let capacity = iter.size_hint().0.max(DEFAULT_ARRAY_CAP);
@@ -413,15 +524,13 @@ impl<T> FromIterator<T> for AtomicArray<T> {
 }
 
 impl<T> Default for AtomicArray<T> {
-    /// Creates a new empty AtomicArray
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<T: fmt::Debug> fmt::Debug for AtomicArray<T> {
-    /// Implements Debug for AtomicArray.
-    /// Displays the current length and capacity.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AtomicArray")
             .field("len", &self.len())
