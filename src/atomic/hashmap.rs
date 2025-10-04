@@ -1,5 +1,5 @@
 use crate::atomic::{AtomicArray, AtomicVec};
-use crate::mutex::{Mutex, WatchGuardMut, WatchGuardRef};
+use crate::mutex::{Backoff, Mutex, WatchGuardMut, WatchGuardRef};
 use crossbeam_utils::CachePadded;
 use std::borrow::Borrow;
 use std::fmt;
@@ -8,7 +8,7 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 /// Number of shards (buckets)
 const NUM_SHARDS: usize = 32;
@@ -57,7 +57,12 @@ struct Shard<K, V> {
     slots: AtomicArray<*mut Slot<K, V>>,
     /// Current size of this shard
     size: AtomicUsize,
+    /// Accurate count of entries in this shard (updated atomically)
+    count: CachePadded<AtomicUsize>,
+    /// Mutex for structural operations (resize only)
     mutex: Mutex,
+    /// Flag indicating resize is in progress
+    resize_in_progress: AtomicBool,
 }
 
 impl<K: Eq + Hash, V> Shard<K, V> {
@@ -65,7 +70,9 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         Self {
             slots: AtomicArray::init_with(size, || Box::into_raw(Box::new(Slot::new()))),
             size: AtomicUsize::new(size),
+            count: CachePadded::new(AtomicUsize::new(0)),
             mutex: Mutex::new(),
+            resize_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -74,9 +81,8 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         Some(unsafe { &**self.slots.get(index)? })
     }
 
+    /// Insert without shard-level locking (caller must ensure no resize conflicts)
     fn insert(&self, slot_idx: usize, key: K, value: V) -> Option<V> {
-        self.mutex.lock_shared();
-
         let slot = self.get_slot(slot_idx).expect("invalid slot index");
 
         slot.mutex.lock_exclusive();
@@ -86,6 +92,7 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         while !cur.is_null() {
             unsafe {
                 if (*cur).key == key {
+                    // Key exists, replace value (no count change)
                     let old_value = ManuallyDrop::into_inner(std::ptr::read(&(*cur).value));
                     (*cur).value = ManuallyDrop::new(value);
                     slot.mutex.unlock_exclusive();
@@ -104,17 +111,27 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         }
         slot.head.store(new_entry, Ordering::Release);
 
+        // Increment shard count for new entry
+        self.count.fetch_add(1, Ordering::Relaxed);
+
         slot.mutex.unlock_exclusive();
-        self.mutex.unlock_shared();
         None
     }
 
+    /// Get with only slot-level locking
     fn get<Q: ?Sized>(&self, slot_idx: usize, key: &Q) -> Option<WatchGuardRef<'_, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.mutex.lock_shared();
+        // Wait if resize is in progress
+        if self.resize_in_progress.load(Ordering::Acquire) {
+            let backoff = Backoff::new();
+            while self.resize_in_progress.load(Ordering::Acquire) {
+                backoff.snooze();
+            }
+        }
+
         let slot = self.get_slot(slot_idx)?;
         slot.mutex.lock_shared();
 
@@ -123,7 +140,6 @@ impl<K: Eq + Hash, V> Shard<K, V> {
             unsafe {
                 if (*cur).key.borrow() == key {
                     let guard = WatchGuardRef::new(&*(*cur).value, slot.mutex.deref().clone());
-                    self.mutex.unlock_shared();
                     return Some(guard);
                 }
                 cur = (*cur).next.load(Ordering::Acquire);
@@ -131,16 +147,23 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         }
 
         slot.mutex.unlock_shared();
-        self.mutex.unlock_shared();
         None
     }
 
+    /// Get mutable with only slot-level locking
     fn get_mut<Q: ?Sized>(&self, slot_idx: usize, key: &Q) -> Option<WatchGuardMut<'_, V>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.mutex.lock_shared();
+        // Wait if resize is in progress
+        if self.resize_in_progress.load(Ordering::Acquire) {
+            let backoff = Backoff::new();
+            while self.resize_in_progress.load(Ordering::Acquire) {
+                backoff.snooze();
+            }
+        }
+
         let slot = self.get_slot(slot_idx)?;
         slot.mutex.lock_exclusive();
 
@@ -156,16 +179,23 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         }
 
         slot.mutex.unlock_exclusive();
-        self.mutex.unlock_shared();
         None
     }
 
+    /// Remove with only slot-level locking
     fn remove<Q: ?Sized>(&self, slot_idx: usize, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.mutex.lock_shared();
+        // Wait if resize is in progress
+        if self.resize_in_progress.load(Ordering::Acquire) {
+            let backoff = Backoff::new();
+            while self.resize_in_progress.load(Ordering::Acquire) {
+                backoff.snooze();
+            }
+        }
+
         let slot = self.get_slot(slot_idx)?;
         slot.mutex.lock_exclusive();
 
@@ -185,6 +215,9 @@ impl<K: Eq + Hash, V> Shard<K, V> {
                     let value = ManuallyDrop::into_inner(std::ptr::read(&(*cur).value));
                     drop(Box::from_raw(cur));
 
+                    // Decrement shard count
+                    self.count.fetch_sub(1, Ordering::Relaxed);
+
                     slot.mutex.unlock_exclusive();
                     return Some(value);
                 }
@@ -194,16 +227,23 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         }
 
         slot.mutex.unlock_exclusive();
-        self.mutex.unlock_shared();
         None
     }
 
+    /// Contains key check with only slot-level locking
     fn contains<Q: ?Sized>(&self, slot_idx: usize, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.mutex.lock_shared();
+        // Wait if resize is in progress
+        if self.resize_in_progress.load(Ordering::Acquire) {
+            let backoff = Backoff::new();
+            while self.resize_in_progress.load(Ordering::Acquire) {
+                backoff.snooze();
+            }
+        }
+
         let slot = self.get_slot(slot_idx).unwrap();
         slot.mutex.lock_shared();
 
@@ -219,71 +259,117 @@ impl<K: Eq + Hash, V> Shard<K, V> {
         }
 
         slot.mutex.unlock_shared();
-        self.mutex.unlock_shared();
         false
     }
 
+    /// Resize with full synchronization
     fn maybe_resize<S: BuildHasher>(&self, hasher: &S) -> bool {
         let old_size = self.size.load(Ordering::Acquire);
-        let count = self.len();
+        let current_count = self.count.load(Ordering::Acquire);
 
-        if (count as f64) < (old_size as f64 * LOAD_FACTOR_THRESHOLD) {
+        // Check load factor
+        if (current_count as f64) < (old_size as f64 * LOAD_FACTOR_THRESHOLD) {
             return false;
         }
 
-        let prev_values = self.slots.as_vec();
-
-        let new_size = self.slots.reset_with(old_size * 2, || Box::into_raw(Box::new(Slot::new()))).unwrap();
-
-        // rehash all entries
-        for slot in prev_values {
-            let old_slot = unsafe { &*slot };
-            old_slot.mutex.lock_exclusive();
-
-            let mut cur_entry = old_slot.head.load(Ordering::Acquire);
-            while !cur_entry.is_null() {
-                let entry = unsafe { &(*cur_entry) };
-                let next_entry = entry.next.load(Ordering::Acquire);
-
-                // recompute new slot index
-                let mut h = hasher.build_hasher();
-                entry.key.hash(&mut h);
-                let new_slot_idx = (h.finish() as usize) % new_size;
-
-                let new_slot = unsafe { &**self.slots.get(new_slot_idx).unwrap() };
-
-                entry
-                    .next
-                    .store(new_slot.head.load(Ordering::Acquire), Ordering::Release);
-
-                new_slot.head.store(cur_entry, Ordering::Release);
-
-                cur_entry = next_entry
-            }
-
-            old_slot.mutex.unlock_exclusive();
+        // Try to set resize flag atomically (only one thread can resize)
+        if self.resize_in_progress.compare_exchange(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed
+        ).is_err() {
+            // Another thread is already resizing
+            return false;
         }
 
-        self.size.store(new_size, Ordering::Release);
-        true
-    }
+        // Acquire exclusive lock on shard structure
+        self.mutex.lock_exclusive();
 
-    fn len(&self) -> usize {
-        let mut total = 0;
-        let size = self.size.load(Ordering::Acquire);
-        for i in 0..size {
-            if let Some(slot_ptr) = self.slots.get(i) {
+        // Lock all old slots exclusively to prevent concurrent access during rehash
+        for i in 0..old_size {
+            if let Some(slot) = self.get_slot(i) {
+                slot.mutex.lock_exclusive();
+            }
+        }
+
+        // Save old slot pointers before reset
+        let old_slot_ptrs = self.slots.as_vec();
+        let new_size = old_size * 2;
+
+        // Reset with new size (this deallocates the old AtomicArray internal structure)
+        let result = self.slots.reset_with(new_size, || Box::into_raw(Box::new(Slot::new())));
+
+        if let Ok(actual_size) = result {
+            // Count entries during rehash to verify count
+            let mut actual_count = 0;
+
+            // Rehash all entries from old slots to new slots
+            for slot_ptr in &old_slot_ptrs {
+                let old_slot = unsafe { &**slot_ptr };
+
+                let mut cur_entry = old_slot.head.load(Ordering::Acquire);
+                while !cur_entry.is_null() {
+                    let entry = unsafe { &(*cur_entry) };
+                    let next_entry = entry.next.load(Ordering::Acquire);
+
+                    // Count this entry
+                    actual_count += 1;
+
+                    // Recompute new slot index
+                    let mut h = hasher.build_hasher();
+                    entry.key.hash(&mut h);
+                    let new_slot_idx = (h.finish() as usize) % actual_size;
+
+                    let new_slot = unsafe { &**self.slots.get(new_slot_idx).unwrap() };
+
+                    // Insert into new chain (no need to lock, we're building)
+                    entry
+                        .next
+                        .store(new_slot.head.load(Ordering::Acquire), Ordering::Release);
+                    new_slot.head.store(cur_entry, Ordering::Release);
+
+                    cur_entry = next_entry;
+                }
+
+                // Unlock the old slot before deallocating
+                old_slot.mutex.unlock_exclusive();
+            }
+
+            // Now deallocate all old slots (they're empty now, entries moved to new slots)
+            for slot_ptr in old_slot_ptrs {
                 unsafe {
-                    let slot = &**slot_ptr;
-                    let mut cur = slot.head.load(Ordering::Acquire);
-                    while !cur.is_null() {
-                        total += 1;
-                        cur = (*cur).next.load(Ordering::Acquire);
-                    }
+                    drop(Box::from_raw(slot_ptr));
+                }
+            }
+
+            // Update size
+            self.size.store(actual_size, Ordering::Release);
+
+            // Correct the count if needed (handles any drift)
+            self.count.store(actual_count, Ordering::Release);
+        } else {
+            // Resize failed, unlock all old slots
+            for i in 0..old_size {
+                if let Some(slot) = self.get_slot(i) {
+                    slot.mutex.unlock_exclusive();
                 }
             }
         }
-        total
+
+        // Release shard lock
+        self.mutex.unlock_exclusive();
+
+        // Clear resize flag
+        self.resize_in_progress.store(false, Ordering::Release);
+
+        result.is_ok()
+    }
+
+    /// Get the current count (O(1) operation)
+    #[inline]
+    fn len(&self) -> usize {
+        self.count.load(Ordering::Acquire)
     }
 }
 
@@ -314,7 +400,6 @@ struct AtomicInner<K, V, S> {
     len: CachePadded<AtomicUsize>,
     ref_count: CachePadded<AtomicUsize>,
     hasher: S,
-    global_lock: CachePadded<Mutex>,
 }
 
 /// Thread-safe HashMap with sharded storage
@@ -346,7 +431,6 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
             len: CachePadded::new(AtomicUsize::new(0)),
             ref_count: CachePadded::new(AtomicUsize::new(1)),
             hasher,
-            global_lock: CachePadded::new(Mutex::new()),
         });
 
         Self {
@@ -373,14 +457,35 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
         let (shard_idx, mut slot_idx) = self.get_indices(hash);
         let shard = &self.inner().shards[shard_idx];
 
-        shard.mutex.lock_exclusive();
-        if shard.maybe_resize(self.hasher()) {
-            (_, slot_idx) = self.get_indices(hash);
-        }
-        shard.mutex.unlock_exclusive();
+        // Check if resize is needed (lock-free check using atomic count)
+        if !shard.resize_in_progress.load(Ordering::Acquire) {
+            let old_size = shard.size.load(Ordering::Acquire);
+            let current_count = shard.count.load(Ordering::Acquire);
 
+            if (current_count as f64) >= (old_size as f64 * LOAD_FACTOR_THRESHOLD) {
+                // Attempt resize (internally synchronized)
+                shard.maybe_resize(self.hasher());
+
+                // Recalculate slot index after potential resize
+                let shard_size = shard.size.load(Ordering::Acquire);
+                slot_idx = (hash as usize) % shard_size;
+            }
+        } else {
+            // Wait for resize to complete
+            let backoff = Backoff::new();
+            while shard.resize_in_progress.load(Ordering::Acquire) {
+                backoff.snooze();
+            }
+
+            // Recalculate slot index
+            let shard_size = shard.size.load(Ordering::Acquire);
+            slot_idx = (hash as usize) % shard_size;
+        }
+
+        // Perform insert (only slot-level locking)
         let res = shard.insert(slot_idx, key, value);
         if res.is_none() {
+            // New entry was added, increment global count
             self.inner().len.fetch_add(1, Ordering::Relaxed);
         }
         res
@@ -415,6 +520,7 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
         let (shard_idx, slot_idx) = self.get_indices(hash);
         let res = self.inner().shards[shard_idx].remove(slot_idx, key);
         if res.is_some() {
+            // Entry was removed, decrement global count
             self.inner().len.fetch_sub(1, Ordering::Relaxed);
         }
         res
@@ -443,6 +549,14 @@ impl<K: Eq + Hash, V, S: BuildHasher + Clone> AtomicHashMap<K, V, S> {
         let mut result = Vec::with_capacity(self.len());
 
         for shard in &self.inner().shards {
+            // Wait if resize in progress
+            if shard.resize_in_progress.load(Ordering::Acquire) {
+                let backoff = Backoff::new();
+                while shard.resize_in_progress.load(Ordering::Acquire) {
+                    backoff.snooze();
+                }
+            }
+
             let size = shard.size.load(Ordering::Acquire);
             for i in 0..size {
                 if let Some(slot) = shard.get_slot(i) {
@@ -472,6 +586,7 @@ impl<K, V, S> AtomicHashMap<K, V, S> {
         unsafe { &*self.ptr }
     }
 
+    /// Returns the total number of elements in the map (O(1) operation)
     pub fn len(&self) -> usize {
         self.inner().len.load(Ordering::Acquire)
     }

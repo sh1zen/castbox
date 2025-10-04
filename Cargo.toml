@@ -19,7 +19,6 @@ path = "src/lib.rs"
 
 [dependencies]
 crossbeam-utils = "0.8.21"
-crossbeam = "0.8.4"
 
 [target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
 libc = "0.2.176"
