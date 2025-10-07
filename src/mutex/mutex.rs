@@ -54,7 +54,7 @@ impl InnerMutex {
 
 #[repr(transparent)]
 pub struct Mutex {
-    ptr: CachePadded<*const InnerMutex>,
+    ptr: *const InnerMutex,
 }
 
 unsafe impl Send for Mutex {}
@@ -67,14 +67,12 @@ impl Mutex {
     /// Create a new mutex instance with reference count = 1
     pub fn new() -> Self {
         let ptr = Box::into_raw(Box::new(InnerMutex::new()));
-        Self {
-            ptr: CachePadded::new(ptr),
-        }
+        Self { ptr }
     }
 
     #[inline(always)]
     fn inner(&self) -> &InnerMutex {
-        unsafe { &**self.ptr }
+        unsafe { &*self.ptr }
     }
 
     /// Returns the current reference count.
@@ -425,7 +423,7 @@ impl Drop for Mutex {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
-            let ptr = *self.ptr as *mut InnerMutex;
+            let ptr = self.ptr as *mut InnerMutex;
             unsafe { drop(Box::from_raw(ptr)) };
         }
     }

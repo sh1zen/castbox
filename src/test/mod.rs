@@ -1,9 +1,8 @@
 mod anyref;
 mod array;
 mod arw;
-mod atomic_list;
-mod atomic_map;
-mod atomic_vec;
+mod map;
+mod vec;
 mod buffer;
 mod grutex;
 mod mpmc;
