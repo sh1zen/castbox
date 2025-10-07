@@ -2,13 +2,12 @@ use crate::mutex::Mutex;
 use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use crossbeam_utils::CachePadded;
 
 /// used as wrapper for a pointer to a reference
 #[must_use = "if unused the Mutex will immediately unlock"]
 pub struct WatchGuardMut<'a, T: ?Sized> {
     data: *mut T,
-    lock: CachePadded<Mutex>,
+    lock: Mutex,
     marker: PhantomData<&'a mut T>,
 }
 
@@ -17,7 +16,7 @@ impl<'mutex, T: ?Sized> WatchGuardMut<'mutex, T> {
     pub fn new(ptr: *mut T, lock: Mutex) -> WatchGuardMut<'mutex, T> {
         Self {
             data: ptr,
-            lock: CachePadded::new(lock),
+            lock,
             marker: PhantomData,
         }
     }

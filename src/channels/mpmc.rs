@@ -62,12 +62,6 @@ impl<T> Mpmc<T> {
         unsafe { &*self.ptr }
     }
 
-    #[inline(always)]
-    fn inner_mut(&self) -> &mut MpmcInner<T> {
-        let ptr = self.ptr as *mut MpmcInner<T>;
-        unsafe { &mut *ptr }
-    }
-
     /// Attempts to send a value **without blocking**.
     ///
     /// Returns `Err(value)` if the buffer is full or the channel is closed.

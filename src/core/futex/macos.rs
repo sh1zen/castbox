@@ -17,7 +17,7 @@ use core::{
 // These exist since macOS 11, iOS 14, and watchOS 7.
 
 #[link(name = "c++")]
-extern "C" {
+unsafe extern "C" {
     // std::__1::__libcpp_atomic_monitor(void const volatile*)
     #[link_name = "_ZNSt3__123__libcpp_atomic_monitorEPVKv"]
     fn __libcpp_atomic_monitor(ptr: *const c_void) -> i64;

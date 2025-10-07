@@ -3,6 +3,7 @@ use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::sync::atomic::{self, AtomicUsize, Ordering};
+use crossbeam_utils::CachePadded;
 
 /// Internal representation of the atomic cell.
 /// Provides interior mutability through a Mutex.
@@ -13,7 +14,7 @@ struct Inner<T> {
     /// Mutex protecting concurrent access
     state: Mutex,
     /// Reference count for clone/drop semantics
-    ref_count: AtomicUsize,
+    ref_count: CachePadded<AtomicUsize>,
 }
 
 impl<T> Inner<T> {
@@ -22,7 +23,7 @@ impl<T> Inner<T> {
         Self {
             val: UnsafeCell::new(MaybeUninit::new(val)),
             state: Mutex::new(),
-            ref_count: AtomicUsize::new(1),
+            ref_count: CachePadded::new(AtomicUsize::new(1)),
         }
     }
 }

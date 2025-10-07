@@ -101,3 +101,9 @@ impl fmt::Debug for RwFutex {
             .finish()
     }
 }
+
+impl Default for RwFutex {
+    fn default() -> Self {
+        Self::new()
+    }
+}

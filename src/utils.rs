@@ -36,7 +36,7 @@ pub fn dealloc_layout<T>(raw: *mut T) {
 }
 
 #[inline]
-pub fn dealloc_raw_pointer<T>(raw: *mut T) {
+pub unsafe fn dealloc_raw_pointer<T>(raw: *mut T) {
     unsafe {
         ptr::drop_in_place(raw);
         dealloc_layout::<T>(raw);

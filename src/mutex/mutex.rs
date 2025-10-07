@@ -54,7 +54,7 @@ impl InnerMutex {
 
 #[repr(transparent)]
 pub struct Mutex {
-    ptr: CachePadded<*const InnerMutex>,
+    ptr: *const InnerMutex,
 }
 
 unsafe impl Send for Mutex {}
@@ -67,14 +67,12 @@ impl Mutex {
     /// Create a new mutex instance with reference count = 1
     pub fn new() -> Self {
         let ptr = Box::into_raw(Box::new(InnerMutex::new()));
-        Self {
-            ptr: CachePadded::new(ptr),
-        }
+        Self { ptr }
     }
 
     #[inline(always)]
     fn inner(&self) -> &InnerMutex {
-        unsafe { &**self.ptr }
+        unsafe { &*self.ptr }
     }
 
     /// Returns the current reference count.
@@ -232,13 +230,13 @@ impl Mutex {
         let inner = self.inner();
         let state = inner.state.load(Ordering::Relaxed);
 
-        if let Some(new_state) = state.checked_add(ONE_READER) {
-            if new_state & ONE_WRITER != ONE_WRITER {
-                return inner
-                    .state
-                    .compare_exchange(state, new_state, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok();
-            }
+        if let Some(new_state) = state.checked_add(ONE_READER)
+            && new_state & ONE_WRITER != ONE_WRITER
+        {
+            return inner
+                .state
+                .compare_exchange(state, new_state, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok();
         }
 
         false
@@ -282,8 +280,8 @@ impl Mutex {
         let prev_state = inner.state.fetch_sub(ONE_READER, Ordering::Release);
 
         // If last reader and writers are waiting, wake one writer
-        if prev_state == (ONE_READER | WRITERS_PARKED) {
-            if inner
+        if prev_state == (ONE_READER | WRITERS_PARKED)
+            && inner
                 .state
                 .compare_exchange(
                     WRITERS_PARKED,
@@ -292,10 +290,9 @@ impl Mutex {
                     Ordering::Relaxed,
                 )
                 .is_ok()
-            {
-                inner.writers_futex.fetch_add(1, Ordering::Release);
-                futex_wake(&*inner.writers_futex);
-            }
+        {
+            inner.writers_futex.fetch_add(1, Ordering::Release);
+            futex_wake(&*inner.writers_futex);
         }
     }
 
@@ -425,9 +422,15 @@ impl Drop for Mutex {
     fn drop(&mut self) {
         if self.inner().ref_count.fetch_sub(1, Ordering::Release) == 1 {
             atomic::fence(Ordering::Acquire);
-            let ptr = *self.ptr as *mut InnerMutex;
+            let ptr = self.ptr as *mut InnerMutex;
             unsafe { drop(Box::from_raw(ptr)) };
         }
+    }
+}
+
+impl Default for Mutex {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -493,7 +493,7 @@ impl<T> FromIterator<T> for AtomicArray<T> {
 }
 
 impl<T> Default for AtomicArray<T> {
-    #[inline]
+
     fn default() -> Self {
         Self::new()
     }

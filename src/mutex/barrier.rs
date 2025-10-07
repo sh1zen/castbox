@@ -1,5 +1,6 @@
 use crate::core::scondvar::SCondVar;
 use crate::core::smutex::SMutex;
+use crate::mutex::Mutex;
 use std::sync::atomic;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -105,6 +106,12 @@ impl Drop for Barrier {
             let ptr = self.ptr as *mut BarrierInner;
             unsafe { drop(Box::from_raw(ptr)) };
         }
+    }
+}
+
+impl Default for Barrier {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

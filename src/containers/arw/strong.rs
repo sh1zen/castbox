@@ -82,12 +82,6 @@ impl<T> Arw<T> {
         unsafe { &*ptr }
     }
 
-    #[inline]
-    fn inner_mut(&self) -> &mut ArwInner<T> {
-        let ptr: *mut ArwInner<T> = self.get_mut_inner_ptr();
-        unsafe { &mut *ptr }
-    }
-
     pub fn is_locked(&self) -> bool {
         self.inner().lock.is_locked_exclusive()
     }
@@ -329,7 +323,8 @@ impl<T: Sized> Arw<T> {
     /// assert_eq!(a.as_ref(), 123);
     /// ```
     pub fn fill(this: Self, value: T) -> Self {
-        let ref_inner = &mut *this.inner_mut();
+        let ptr: *mut ArwInner<T> = this.get_mut_inner_ptr();
+        let ref_inner = unsafe { &mut *ptr };
         ref_inner.lock.lock_exclusive();
         ref_inner.val = UnsafeCell::new(value);
         ref_inner.lock.unlock_exclusive();

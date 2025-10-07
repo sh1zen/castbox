@@ -1,6 +1,6 @@
 mod tests_mpmc {
     use crate::channels::mpmc::Mpmc;
-    use crate::atomic::AtomicList;
+    use crate::atomic::{AtomicVec};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -23,11 +23,11 @@ mod tests_mpmc {
             .collect();
 
         // Lanciamo 4 consumer
-        let results = AtomicList::new(); // riutilizziamo AtomicVec per raccogliere risultati
+        let results = AtomicVec::new(); // riutilizziamo AtomicVec per raccogliere risultati
         let consumers: Vec<_> = (0..4)
             .map(|_| {
                 let ch = Mpmc::clone(&ch);
-                let results = AtomicList::clone(&results);
+                let results = AtomicVec::clone(&results);
                 thread::spawn(move || {
                     while let Some(v) = ch.recv() {
                         results.push(v);
