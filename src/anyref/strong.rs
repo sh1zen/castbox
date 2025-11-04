@@ -2,10 +2,10 @@ use crate::anyref::inner::{AnyRefInner, MAX_REFCOUNT};
 use crate::anyref::ptr_interface::PtrInterface;
 use crate::anyref::weak::WeakAnyRef;
 use crate::utils::is_dangling;
-use crossync::sync::{WatchGuardMut, WatchGuardRef};
+use crossync::sync::{RwLock, WatchGuardMut, WatchGuardRef};
 use std::any::{Any, TypeId};
-use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::process::abort;
 use std::sync::atomic;
@@ -48,29 +48,52 @@ impl AnyRef {
     /// let value = AnyRef::try_unwrap::<i32>(a).unwrap();
     /// assert_eq!(value, 123i32);
     /// ```
-    pub fn try_unwrap<T>(this: Self) -> Result<T, Self> {
-        this.inner().lock.lock_exclusive();
+    pub fn try_unwrap<'a, T>(this: Self) -> Result<T, Self>
+    where
+        T: Any + Sized,
+    {
+        // attempt to become sole owner by changing strong from 1 -> 0
         if this
             .inner()
             .strong
             .compare_exchange(1, 0, Acquire, Relaxed)
             .is_err()
         {
-            this.inner().lock.unlock_exclusive();
             return Err(this);
         }
 
+        // synchronize with the decrement that triggered deletion semantics
         atomic::fence(Acquire);
 
+        // Check weak count. If it's not the implicit weak (1), restore and return Err.
+        let weak_count = unsafe { (&*this.ptr).weak.load(Relaxed) };
+        if weak_count != 1 {
+            // Restore strong to 1 so the object remains live and return the original Arw.
+            // Use Release to pair with potential reads by other threads (mirrors similar patterns).
+            unsafe {
+                (&*this.ptr).strong.store(1, Release);
+            }
+            return Err(this);
+        }
+
+        // we will consume `this` on success; keep it alive for now
         let this = ManuallyDrop::new(this);
-        let this_data = unsafe { &**(*this.ptr).data.get() as *const _ };
+
+        // if the type doesn't match, restore strong count and return Err
+        if this.inner().type_id != TypeId::of::<T>() {
+            // restore strong count back to 1 so the AnyRef remains valid
+            // (we're running on the error path so we must not have destroyed the object)
+            this.inner().strong.store(1, Release);
+            return Err(ManuallyDrop::into_inner(this));
+        }
+
+        let this_data = &**this.inner().data.lock_exclusive() as *const _;
         let elem: T = unsafe { ptr::read(this_data as *const T) };
 
         // Make a weak pointer to clean up the implicit strong-weak reference
         let _weak = WeakAnyRef { ptr: this.ptr };
 
         unsafe { ptr::drop_in_place(&mut (*this.get_mut_inner_ptr()).data) }
-        unsafe { ptr::drop_in_place(&mut (*this.get_mut_inner_ptr()).lock) }
 
         Ok(elem)
     }
@@ -87,10 +110,6 @@ impl AnyRef {
     fn inner_mut(&mut self) -> &mut AnyRefInner {
         let ptr: *mut AnyRefInner = self.get_mut_inner_ptr();
         unsafe { &mut *ptr }
-    }
-
-    pub fn is_locked(&self) -> bool {
-        self.inner().lock.is_locked_exclusive()
     }
 
     #[inline]
@@ -251,7 +270,7 @@ impl AnyRef {
         let inner: *mut AnyRefInner = this.get_mut_inner_ptr();
 
         // Make sure Miri realizes that we transition from a noalias pointer to a raw pointer here.
-        let cell_ptr: *const UnsafeCell<Box<dyn Any>> = unsafe { ptr::addr_of!((*inner).data) };
+        let cell_ptr: *const RwLock<Box<dyn Any>> = unsafe { ptr::addr_of!((*inner).data) };
         let data_ptr: *const Box<dyn Any> = cell_ptr.cast::<Box<dyn Any>>();
 
         data_ptr
@@ -282,17 +301,10 @@ impl PtrInterface for AnyRef {
 impl AnyRef {
     pub fn try_downcast_ref<U: Any>(&self) -> Option<WatchGuardRef<'_, U>> {
         if self.inner().type_id == TypeId::of::<U>() {
-            let lock = self.inner().lock.clone();
-            lock.lock_shared();
-
-            let data = self.inner().get_ref().downcast_ref::<U>();
-
-            match data {
-                Some(t) => Some(WatchGuardRef::new(t, lock)),
-                None => {
-                    lock.unlock_shared();
-                    None
-                }
+            let guard = self.inner().data.lock_shared();
+            match unsafe { WatchGuardRef::downcast::<U>(guard) } {
+                Ok(guard) => Some(guard),
+                Err(_) => None,
             }
         } else {
             None
@@ -301,17 +313,10 @@ impl AnyRef {
 
     pub fn try_downcast_mut<U: Any>(&self) -> Option<WatchGuardMut<'_, U>> {
         if self.inner().type_id == TypeId::of::<U>() {
-            let lock = self.inner().lock.clone();
-            lock.lock_exclusive();
-
-            let data = self.inner().get_mut_ref().downcast_mut::<U>();
-
-            match data {
-                Some(t) => Some(WatchGuardMut::new(t, lock)),
-                None => {
-                    lock.unlock_exclusive();
-                    None
-                }
+            let guard = self.inner().data.lock_exclusive();
+            match unsafe { WatchGuardMut::downcast::<U>(guard) } {
+                Ok(guard) => Some(guard),
+                Err(_) => None,
             }
         } else {
             None
@@ -386,10 +391,10 @@ impl AnyRef {
     /// ```
     pub fn fill<T: 'static>(mut this: Self, value: T) -> Self {
         let ref_inner = &mut *this.inner_mut();
-        ref_inner.lock.lock_exclusive();
-        ref_inner.data = UnsafeCell::new(Box::new(value));
+        let mut wd = ref_inner.data.lock_exclusive();
+        *wd = Box::new(value);
         ref_inner.type_id = TypeId::of::<T>();
-        ref_inner.lock.unlock_exclusive();
+        drop(wd);
         this
     }
 }
@@ -406,8 +411,6 @@ impl Drop for AnyRef {
         atomic::fence(Acquire);
 
         let _weak = WeakAnyRef { ptr: self.ptr };
-
-        unsafe { ptr::drop_in_place(&mut (*self.get_mut_inner_ptr()).lock) }
 
         unsafe { ptr::drop_in_place(&mut (*self.get_mut_inner_ptr()).data) }
     }
@@ -486,6 +489,6 @@ impl fmt::Debug for AnyRef {
 
 impl fmt::Pointer for AnyRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&self.inner().data.get(), f)
+        fmt::Pointer::fmt(&self.inner().data.lock_shared().deref(), f)
     }
 }

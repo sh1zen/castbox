@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "castbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossync",
 ]
@@ -17,9 +17,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossync"
-version = "0.0.1"
+version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b607a96214aeeee5e6eca3caa76d640210a893732adf712e25b5a92201bcc839"
+checksum = "a1d7ac2feb3ce04d18c4cc20a986c1d940f1861e8007e7d55ec3ffeace06206c"
 dependencies = [
  "crossbeam-utils",
  "libc",

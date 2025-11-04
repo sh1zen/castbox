@@ -12,8 +12,11 @@ mod tests_any_ref {
         let a = AnyRef::new("hello".to_string());
 
         if let Some(s) = a.try_downcast_ref::<String>() {
-            assert_eq!(*s, "hello");
+            assert_eq!(s, "hello");
+            drop(s);
         }
+
+
 
         if let Some(mut s) = a.try_downcast_mut::<String>() {
             *s = "hello:1".to_string();
