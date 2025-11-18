@@ -22,5 +22,8 @@ pub mod utils;
 
 pub use anyref::{AnyRef, WeakAnyRef};
 pub use arw::{Arw, WeakArw};
+pub use crossync::sync::WatchGuardMut;
+pub use crossync::sync::WatchGuardRef;
+
 #[cfg(test)]
 mod test;
