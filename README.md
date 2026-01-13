@@ -102,7 +102,7 @@ Open your Cargo.toml and add:
 
 ```toml
 [dependencies]
-castbox = "0.1.1" # or the latest version available 
+castbox = "0.1.3" # or the latest version available 
 ```
 ---
 

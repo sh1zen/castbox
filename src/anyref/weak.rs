@@ -30,7 +30,6 @@ impl WeakAnyRef {
     pub const fn new() -> WeakAnyRef {
         let ptr: *const AnyRefInner = ptr::without_provenance(NonZeroUsize::MAX.get());
         let ptr = ptr as *mut AnyRefInner;
-        // SAFETY: we know `addr` is non-zero.
         WeakAnyRef { ptr }
     }
 
@@ -46,6 +45,22 @@ impl WeakAnyRef {
     /// assert!(w.upgrade().is_none());
     /// ```
     pub fn upgrade(&self) -> Option<AnyRef> {
+        // First check if this is a dangling pointer (never allocated or default)
+        let ptr = self.ptr;
+        if is_dangling(ptr) {
+            return None;
+        }
+
+        // SAFETY: We access only the atomic `strong` field via raw pointer.
+        // The AnyRefInner struct itself is guaranteed to be allocated as long as
+        // there's at least one weak reference (which we hold).
+        // We do NOT create a reference to the entire AnyRefInner struct here,
+        // only to the atomic field, which avoids conflicts with concurrent
+        // drop_in_place of the data field in AnyRef::drop.
+        let inner_ptr = ptr as *mut AnyRefInner;
+        let strong_ptr = unsafe { ptr::addr_of!((*inner_ptr).strong) };
+        let strong_atomic = unsafe { &*strong_ptr };
+
         #[inline]
         fn checked_increment(n: usize) -> Option<usize> {
             if n == 0 {
@@ -58,25 +73,36 @@ impl WeakAnyRef {
         // We use a CAS loop to increment the strong count instead of a
         // fetch_add as this function should never take the reference count
         // from zero to one.
-        if self
-            .inner()?
-            .strong
+        //
+        // Acquire ordering synchronizes with the Release in AnyRef::drop's fetch_sub,
+        // ensuring we see all writes to the data before the strong count
+        // was decremented to 0. If strong is 0, the CAS fails and we return None.
+        if strong_atomic
             .fetch_update(Acquire, Relaxed, checked_increment)
             .is_ok()
         {
-            // SAFETY: pointer is not null, verified in checked_increment
+            // SAFETY: The strong count was > 0 and we've incremented it,
+            // so the data is still alive.
             unsafe { Some(AnyRef::from_inner_in(self.get_mut_inner_ptr())) }
         } else {
             None
         }
     }
 
+    /// Returns a reference to the inner `AnyRefInner` if the pointer is not dangling.
+    ///
+    /// # Safety Note
+    /// This should only be used to access atomic fields (strong, weak counts).
+    /// The data field may be in the process of being dropped if strong count is 0.
     #[inline]
     fn inner(&self) -> Option<&AnyRefInner> {
         let ptr = self.ptr;
         if is_dangling(ptr) {
             None
         } else {
+            // SAFETY: If not dangling and we hold a weak ref, the AnyRefInner
+            // struct itself is still allocated (only deallocated when weak count hits 0).
+            // Callers must only access atomic fields (strong, weak).
             Some(unsafe { &*ptr })
         }
     }
@@ -91,11 +117,15 @@ impl WeakAnyRef {
     /// assert_eq!(w.strong_count(), 1);
     /// ```
     pub fn strong_count(&self) -> usize {
-        if let Some(inner) = self.inner() {
-            inner.strong.load(Relaxed)
-        } else {
-            0
+        // Access only the atomic field via raw pointer to avoid data races
+        let ptr = self.ptr;
+        if is_dangling(ptr) {
+            return 0;
         }
+
+        let inner_ptr = ptr as *mut AnyRefInner;
+        let strong_ptr = unsafe { ptr::addr_of!((*inner_ptr).strong) };
+        unsafe { &*strong_ptr }.load(Relaxed)
     }
 
     /// Returns the number of weak references.
@@ -109,11 +139,18 @@ impl WeakAnyRef {
     /// assert_eq!(w2.weak_count(), 2); // includes implicit
     /// ```
     pub fn weak_count(&self) -> usize {
-        if let Some(inner) = self.inner() {
-            inner.weak.load(Relaxed) - 1
-        } else {
-            0
+        // Access only the atomic field via raw pointer to avoid data races
+        let ptr = self.ptr;
+        if is_dangling(ptr) {
+            return 0;
         }
+
+        let inner_ptr = ptr as *mut AnyRefInner;
+        let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
+        let count = unsafe { &*weak_ptr }.load(Relaxed);
+
+        // Subtract 1 for the implicit weak reference held by strong refs
+        if count > 0 { count - 1 } else { 0 }
     }
 }
 
@@ -128,9 +165,16 @@ impl Clone for WeakAnyRef {
     /// let w2 = w1.clone();
     /// ```
     fn clone(&self) -> WeakAnyRef {
-        if let Some(inner) = self.inner() {
-            let old_size = inner.weak.fetch_add(1, Relaxed);
+        let ptr = self.ptr;
 
+        // If dangling, just copy the dangling pointer
+        if !is_dangling(ptr) {
+            // Access only the atomic field via raw pointer
+            let inner_ptr = ptr as *mut AnyRefInner;
+            let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
+            let weak_atomic = unsafe { &*weak_ptr };
+
+            let old_size = weak_atomic.fetch_add(1, Relaxed);
             if old_size > MAX_REFCOUNT {
                 abort();
             }
@@ -171,12 +215,20 @@ impl PtrInterface for WeakAnyRef {
 
 impl Drop for WeakAnyRef {
     fn drop(&mut self) {
-        let inner = if let Some(inner) = self.inner() {
-            inner
-        } else {
+        let ptr = self.ptr;
+
+        // If dangling, nothing to do
+        if is_dangling(ptr) {
             return;
-        };
-        if inner.weak.fetch_sub(1, Release) == 1 {
+        }
+
+        // Access only the atomic field via raw pointer
+        let inner_ptr = ptr as *mut AnyRefInner;
+        let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
+        let weak_atomic = unsafe { &*weak_ptr };
+
+        if weak_atomic.fetch_sub(1, Release) == 1 {
+            // We were the last weak reference, deallocate the AnyRefInner
             atomic::fence(Acquire);
 
             let layout = Layout::new::<AnyRefInner>();

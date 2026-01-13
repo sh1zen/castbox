@@ -30,9 +30,16 @@ where
             ptr as *const dyn Any
         } else {
             // SAFETY: if is_dangling returns false, then the pointer is dereferenceable.
-            // The payload may be dropped at this point, and we have to maintain provenance,
-            // so use raw pointer manipulation.
-            unsafe { &mut **(*ptr).data.lock_exclusive() as *const dyn Any }
+            // We access the data field through the lock to ensure proper synchronization.
+            // Note: This method should only be called when we have a valid strong reference,
+            // which guarantees the data hasn't been dropped.
+            //
+            // We use ptr::addr_of! to get the address of the data field without creating
+            // a reference to the entire AnyRefInner struct first.
+            unsafe {
+                let data_field_ptr = ptr::addr_of!((*ptr).data);
+                &mut **(*data_field_ptr).lock_exclusive() as *const dyn Any
+            }
         }
     }
 
