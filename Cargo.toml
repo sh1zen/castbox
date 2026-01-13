@@ -1,6 +1,6 @@
 [package]
 name = "castbox"
-version = "0.1.2"
+version = "0.1.4"
 authors = ["Andrea Frolli dev.sh1zen@outlook.it"]
 edition = "2024"
 description = "A Runtime-Typed Reference-Counted Smart Pointer and Concurrent Programming tools."
@@ -14,7 +14,7 @@ exclude = [".gitignore", ".github/*"]
 homepage = "https://github.com/sh1zen/castbox"
 
 [dependencies]
-crossync = "0.0.4"
+crossync = "0.1.1"
 
 [lib]
 name = "castbox"

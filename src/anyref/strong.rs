@@ -2,7 +2,7 @@ use crate::anyref::inner::{AnyRefInner, MAX_REFCOUNT};
 use crate::anyref::ptr_interface::PtrInterface;
 use crate::anyref::weak::WeakAnyRef;
 use crate::utils::is_dangling;
-use crossync::sync::{RwLock, WatchGuardMut, WatchGuardRef};
+use crossync::sync::{WatchGuardMut, WatchGuardRef};
 use std::any::{Any, TypeId};
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
@@ -48,67 +48,93 @@ impl AnyRef {
     /// let value = AnyRef::try_unwrap::<i32>(a).unwrap();
     /// assert_eq!(value, 123i32);
     /// ```
-    pub fn try_unwrap<'a, T>(this: Self) -> Result<T, Self>
+    pub fn try_unwrap<T>(this: Self) -> Result<T, Self>
     where
         T: Any + Sized,
     {
-        // attempt to become sole owner by changing strong from 1 -> 0
-        if this
-            .inner()
-            .strong
+        let inner_ptr = this.ptr as *mut AnyRefInner;
+
+        // SAFETY: We access only atomic fields via raw pointer arithmetic
+        let strong_ptr = unsafe { ptr::addr_of!((*inner_ptr).strong) };
+        let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
+        let type_id = unsafe { ptr::addr_of!((*inner_ptr).type_id).read() };
+
+        // Attempt to become sole owner by changing strong from 1 -> 0
+        if unsafe { &*strong_ptr }
             .compare_exchange(1, 0, Acquire, Relaxed)
             .is_err()
         {
             return Err(this);
         }
 
-        // synchronize with the decrement that triggered deletion semantics
+        // Synchronize with the decrement that triggered deletion semantics
         atomic::fence(Acquire);
 
         // Check weak count. If it's not the implicit weak (1), restore and return Err.
-        let weak_count = unsafe { (&*this.ptr).weak.load(Relaxed) };
+        let weak_count = unsafe { &*weak_ptr }.load(Relaxed);
         if weak_count != 1 {
-            // Restore strong to 1 so the object remains live and return the original Arw.
-            // Use Release to pair with potential reads by other threads (mirrors similar patterns).
-            unsafe {
-                (&*this.ptr).strong.store(1, Release);
-            }
+            // Restore strong to 1 so the object remains live and return the original AnyRef.
+            unsafe { &*strong_ptr }.store(1, Release);
             return Err(this);
         }
 
-        // we will consume `this` on success; keep it alive for now
+        // We will consume `this` on success; keep it alive for now
         let this = ManuallyDrop::new(this);
 
-        // if the type doesn't match, restore strong count and return Err
-        if this.inner().type_id != TypeId::of::<T>() {
-            // restore strong count back to 1 so the AnyRef remains valid
-            // (we're running on the error path so we must not have destroyed the object)
-            this.inner().strong.store(1, Release);
+        // If the type doesn't match, restore strong count and return Err
+        if type_id != TypeId::of::<T>() {
+            // Restore strong count back to 1 so the AnyRef remains valid
+            unsafe { &*strong_ptr }.store(1, Release);
             return Err(ManuallyDrop::into_inner(this));
         }
 
-        let this_data = &**this.inner().data.lock_exclusive() as *const _;
-        let elem: T = unsafe { ptr::read(this_data as *const T) };
+        // SAFETY: We've verified the type and have exclusive access.
+        // We need to extract the value without triggering a double-drop.
+        let data_ptr = unsafe { ptr::addr_of_mut!((*inner_ptr).data) };
+
+        // Extract the value from the Box<dyn Any>
+        let elem: T = unsafe {
+            let mut guard = (*data_ptr).lock_exclusive();
+
+            // Take the Box<dyn Any> out of the guard, replacing with a dummy
+            let boxed_any: Box<dyn Any> = std::mem::replace(&mut *guard, Box::new(()));
+            drop(guard);
+
+            // Downcast to Box<T> and unbox
+            match boxed_any.downcast::<T>() {
+                Ok(boxed_t) => *boxed_t,
+                Err(_) => unreachable!("Type mismatch after type_id check"),
+            }
+        };
 
         // Make a weak pointer to clean up the implicit strong-weak reference
+        // and deallocate the AnyRefInner when it drops
         let _weak = WeakAnyRef { ptr: this.ptr };
 
-        unsafe { ptr::drop_in_place(&mut (*this.get_mut_inner_ptr()).data) }
+        // Drop the data field - it now contains a dummy Box<()> which is safe to drop
+        unsafe {
+            let data_field_ptr = ptr::addr_of_mut!((*inner_ptr).data);
+            ptr::drop_in_place(data_field_ptr);
+        }
 
         Ok(elem)
     }
 
+    /// Returns a reference to the inner `AnyRefInner`.
+    ///
+    /// # Safety
+    /// This is safe to call as long as there is at least one strong reference,
+    /// which is guaranteed by holding an `AnyRef`.
     #[inline]
     pub(crate) fn inner(&self) -> &AnyRefInner {
-        // This unsafety is ok because while this AnyRef is alive we're guaranteed
-        // that the inner pointer is valid.
-        let ptr: *const AnyRefInner = self.ptr;
-        unsafe { &*ptr }
+        // SAFETY: While this AnyRef is alive we're guaranteed
+        // that the inner pointer is valid and the data hasn't been dropped.
+        unsafe { &*self.ptr }
     }
 
     #[inline]
     fn inner_mut(&mut self) -> &mut AnyRefInner {
-        let ptr: *mut AnyRefInner = self.get_mut_inner_ptr();
+        let ptr = self.get_mut_inner_ptr();
         unsafe { &mut *ptr }
     }
 
@@ -153,28 +179,19 @@ impl AnyRef {
     /// assert!(!AnyRef::is_unique(&a));
     /// ```
     pub fn is_unique(this: &Self) -> bool {
-        // lock the weak pointer count if we appear to be the sole weak pointer
-        // holder.
-        //
-        // The acquire label here ensures a happens-before relationship with any
-        // writes to `strong` (in particular in `Weak::upgrade`) prior to decrements
-        // of the `weak` count (via `Weak::drop`, which uses release). If the upgraded
-        // weak ref was never dropped, the CAS here will fail so we do not care to synchronize.
-        if this
-            .inner()
-            .weak
+        let inner_ptr = this.ptr as *mut AnyRefInner;
+
+        // SAFETY: Access atomic fields via raw pointer to avoid creating reference
+        let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
+        let strong_ptr = unsafe { ptr::addr_of!((*inner_ptr).strong) };
+
+        // Lock the weak pointer count if we appear to be the sole weak pointer holder.
+        if unsafe { &*weak_ptr }
             .compare_exchange(1, usize::MAX, Acquire, Relaxed)
             .is_ok()
         {
-            // This needs to be an `Acquire` to synchronize with the decrement of the `strong`
-            // counter in `drop` -- the only access that happens when any but the last reference
-            // is being dropped.
-            let unique = this.inner().strong.load(Acquire) == 1;
-
-            // The release write here synchronizes with a read in `downgrade`,
-            // effectively preventing the above read of `strong` from happening
-            // after the write.
-            this.inner().weak.store(1, Release); // release the lock
+            let unique = unsafe { &*strong_ptr }.load(Acquire) == 1;
+            unsafe { &*weak_ptr }.store(1, Release);
             unique
         } else {
             false
@@ -190,36 +207,27 @@ impl AnyRef {
     /// let weak_five = AnyRef::downgrade(&five);
     /// ```
     pub fn downgrade(&self) -> WeakAnyRef {
-        // This Relaxed is OK because we're checking the value in the CAS
-        // below.
-        let mut cur = self.inner().weak.load(Relaxed);
+        let inner_ptr = self.ptr as *mut AnyRefInner;
+
+        // SAFETY: Access atomic field via raw pointer
+        let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
+        let weak_atomic = unsafe { &*weak_ptr };
+
+        let mut cur = weak_atomic.load(Relaxed);
 
         loop {
-            // check if the weak counter is currently "locked"; if so, spin.
+            // Check if the weak counter is currently "locked"; if so, spin.
             if cur == usize::MAX {
                 hint::spin_loop();
-                cur = self.inner().weak.load(Relaxed);
+                cur = weak_atomic.load(Relaxed);
                 continue;
             }
 
-            // We can't allow the refcount to increase much past `MAX_REFCOUNT`.
             assert!(cur <= MAX_REFCOUNT, "INTERNAL OVERFLOW ERROR");
 
-            // NOTE: this code currently ignores the possibility of overflow
-            // into usize::MAX; in general both Rc and AnyRef need to be adjusted
-            // to deal with overflow.
-
-            // Unlike with Clone(), we need this to be an Acquire read to
-            // synchronize with the write coming from `is_unique`, so that the
-            // events prior to that write happen before this read.
-            match self
-                .inner()
-                .weak
-                .compare_exchange_weak(cur, cur + 1, Acquire, Relaxed)
-            {
+            match weak_atomic.compare_exchange_weak(cur, cur + 1, Acquire, Relaxed) {
                 Ok(_) => {
-                    // Make sure we do not create a dangling Weak
-                    debug_assert!(!is_dangling(self.inner()));
+                    debug_assert!(!is_dangling(self.ptr));
                     return WeakAnyRef { ptr: self.ptr };
                 }
                 Err(old) => cur = old,
@@ -239,8 +247,6 @@ impl AnyRef {
     #[inline]
     pub fn weak_count(this: &Self) -> usize {
         let cnt = this.inner().weak.load(Relaxed);
-        // If the weak count is currently locked, the value of the
-        // count was 0 just before taking the lock.
         if cnt == usize::MAX { 0 } else { cnt - 1 }
     }
 
@@ -264,16 +270,12 @@ impl AnyRef {
     }
 
     pub fn into_raw(self) -> *const Box<dyn Any> {
-        // prevent auto drop
         let this = ManuallyDrop::new(self);
+        let inner_ptr = this.ptr as *mut AnyRefInner;
 
-        let inner: *mut AnyRefInner = this.get_mut_inner_ptr();
-
-        // Make sure Miri realizes that we transition from a noalias pointer to a raw pointer here.
-        let cell_ptr: *const RwLock<Box<dyn Any>> = unsafe { ptr::addr_of!((*inner).data) };
-        let data_ptr: *const Box<dyn Any> = cell_ptr.cast::<Box<dyn Any>>();
-
-        data_ptr
+        // SAFETY: Get pointer to data field without creating reference to AnyRefInner
+        let cell_ptr = unsafe { ptr::addr_of!((*inner_ptr).data) };
+        cell_ptr as *const Box<dyn Any>
     }
 
     pub unsafe fn from_raw<T: ?Sized>(ptr: *const T) -> Self {
@@ -401,23 +403,41 @@ impl AnyRef {
 
 impl Drop for AnyRef {
     fn drop(&mut self) {
+        let inner_ptr = self.ptr as *mut AnyRefInner;
+
+        // SAFETY: Access the strong count atomically via raw pointer.
+        // This avoids creating a reference to the entire AnyRefInner struct.
+        let strong_ptr = unsafe { ptr::addr_of!((*inner_ptr).strong) };
+
         // Because `fetch_sub` is already atomic, we do not need to synchronize
-        // with other threads unless we are going to delete the object. This
-        // same logic applies to the below `fetch_sub` to the `weak` count.
-        if self.inner().strong.fetch_sub(1, Release) != 1 {
+        // with other threads unless we are going to delete the object.
+        if unsafe { &*strong_ptr }.fetch_sub(1, Release) != 1 {
             return;
         }
 
+        // This fence synchronizes with the Release ordering in the fetch_sub above.
+        // It ensures that all previous writes to the data are visible before we drop it.
         atomic::fence(Acquire);
 
+        // Create a weak reference that will handle deallocation of AnyRefInner
+        // when all weak references are gone.
         let _weak = WeakAnyRef { ptr: self.ptr };
 
-        unsafe { ptr::drop_in_place(&mut (*self.get_mut_inner_ptr()).data) }
+        // SAFETY: We're the last strong reference, so we have exclusive access to the data.
+        // We use ptr::addr_of_mut! to get a raw pointer to the `data` field directly,
+        // without creating a reference to the entire AnyRefInner struct.
+        // This is crucial because WeakAnyRef::upgrade() may concurrently read the atomic
+        // fields (strong, weak) of AnyRefInner, and creating a mutable reference to the
+        // entire struct would conflict with those reads.
+        unsafe {
+            let data_ptr = ptr::addr_of_mut!((*inner_ptr).data);
+            ptr::drop_in_place(data_ptr);
+        }
     }
 }
 
 impl<T: 'static> From<*mut T> for AnyRef {
-    /// Creates a new `AnyRef` taking posses over the pointed value `*mut T`.
+    /// Creates a new `AnyRef` taking possession over the pointed value `*mut T`.
     ///
     /// # Safety
     /// - `ptr` must be valid and pointing to a dynamically allocated instance of T
@@ -442,7 +462,7 @@ impl<T: 'static> From<*mut T> for AnyRef {
 }
 
 impl From<&str> for AnyRef {
-    /// Creates a new `AnyRef` from a `*const T`.
+    /// Creates a new `AnyRef` from a `&str`.
     ///
     /// # Example
     /// ```
@@ -452,7 +472,6 @@ impl From<&str> for AnyRef {
     /// ```
     #[inline]
     fn from(s: &str) -> Self {
-        // copy data to own them
         AnyRef::new(s.to_string())
     }
 }

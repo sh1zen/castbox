@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "castbox"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "crossync",
 ]
@@ -17,9 +17,9 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossync"
-version = "0.0.4"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d7ac2feb3ce04d18c4cc20a986c1d940f1861e8007e7d55ec3ffeace06206c"
+checksum = "713a14e4445ec8c4a752351c1e91c6f00635903331d451b646dae19bd5ce35b4"
 dependencies = [
  "crossbeam-utils",
  "libc",
@@ -28,9 +28,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.177"
+version = "0.2.180"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
+checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
 name = "windows-link"

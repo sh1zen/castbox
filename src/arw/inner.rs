@@ -3,10 +3,10 @@ use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicUsize;
 
-/// Max number of reference that an anyref could have
+/// Max number of references that an Arw could have
 pub(crate) const MAX_REFCOUNT: usize = isize::MAX as usize;
 
-/// Actually the main worker
+/// The inner structure that holds the actual data
 pub(crate) struct ArwInner<T: Sized> {
     pub(crate) strong: AtomicUsize,
     pub(crate) weak: AtomicUsize,

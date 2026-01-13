@@ -53,7 +53,6 @@ impl<T> Arw<T> {
         T: 'static,
     {
         // Try to transition strong 1 -> 0 to become sole strong owner.
-        // If this fails, there are other strong owners: fail.
         if this
             .inner()
             .strong
@@ -63,50 +62,64 @@ impl<T> Arw<T> {
             return Err(this);
         }
 
-        // synchronize with any release operations that may have triggered deletion semantics
+        // synchronize with any release operations
         atomic::fence(Acquire);
 
         // Check weak count. If it's not the implicit weak (1), restore and return Err.
-        let weak_count = unsafe { (&*this.ptr).weak.load(Relaxed) };
+        let weak_count = this.inner().weak.load(Relaxed);
         if weak_count != 1 {
-            // Restore strong to 1 so the object remains live and return the original Arw.
-            // Use Release to pair with potential reads by other threads (mirrors similar patterns).
-            unsafe {
-                (&*this.ptr).strong.store(1, Release);
-            }
+            this.inner().strong.store(1, Release);
             return Err(this);
         }
 
-        // we will consume `this` on success; keep it alive for now
+        // Prevent Drop from running
         let this = ManuallyDrop::new(this);
+        let inner_ptr = this.ptr as *mut ArwInner<T>;
 
-        // Acquire exclusive lock to ensure any outstanding readers finish and we can safely move out T.
-        // (This also provides the same mutual exclusion semantics as the previous implementation.)
-        let this_data = &*this.inner().val.lock_exclusive() as *const _;
-        let elem: T = unsafe { ptr::read(this_data) };
+        unsafe {
+            // Extract the value from the RwLock
+            let guard = (*inner_ptr).val.lock_exclusive();
+            let elem: T = ptr::read(&*guard);
+            drop(guard);
 
-        // Make a weak pointer to clean up the implicit strong-weak reference
-        let _weak = WeakArw { ptr: this.ptr };
+            // We need to drop the RwLock's internals but NOT the T value.
+            // Since RwLock<T> contains T directly, we can't use drop_in_place.
+            // Instead, we manually read and drop the RwLock, then forget the T part.
+            let rwlock = ptr::read(ptr::addr_of!((*inner_ptr).val));
 
-        unsafe { ptr::drop_in_place(&mut (*this.get_mut_inner_ptr()).val) }
+            // Convert RwLock<T> to RwLock<ManuallyDrop<T>> conceptually
+            // by transmuting and then forgetting the inner value
+            let rwlock_md: RwLock<ManuallyDrop<T>> = std::mem::transmute(rwlock);
+            drop(rwlock_md); // This drops RwLock's internals but not T
 
-        Ok(elem)
+            // Decrement weak and deallocate
+            let weak_ptr = ptr::addr_of!((*inner_ptr).weak);
+            if (*weak_ptr).fetch_sub(1, Release) == 1 {
+                atomic::fence(Acquire);
+                std::alloc::dealloc(
+                    inner_ptr as *mut u8,
+                    std::alloc::Layout::new::<ArwInner<T>>(),
+                );
+            }
+
+            Ok(elem)
+        }
     }
 
     #[inline]
     fn inner(&self) -> &ArwInner<T> {
         // This unsafety is ok because while this Arw is alive we're guaranteed
         // that the inner pointer is valid.
-        let ptr: *const ArwInner<T> = self.ptr;
-        unsafe { &*ptr }
+        unsafe { &*self.ptr }
     }
 
     pub fn map<U: 'static, F>(self, func: F) -> Arw<U>
     where
         T: Any,
-        F: FnOnce(WatchGuardRef<'_, T>) -> U,
+        F: FnOnce(&T) -> U,
     {
-        Arw::new(func(self.as_ref()))
+        let guard = self.as_ref();
+        Arw::new(func(&*guard))
     }
 
     /// Returns a reference to the inner value of type `T`.
@@ -151,28 +164,14 @@ impl<T> Arw<T> {
     /// assert!(!Arw::is_unique(&a));
     /// ```
     pub fn is_unique(this: &Self) -> bool {
-        // lock the weak pointer count if we appear to be the sole weak pointer
-        // holder.
-        //
-        // The acquire label here ensures a happens-before relationship with any
-        // writes to `strong` (in particular in `Weak::upgrade`) prior to decrements
-        // of the `weak` count (via `Weak::drop`, which uses release). If the upgraded
-        // weak ref was never dropped, the CAS here will fail so we do not care to synchronize.
         if this
             .inner()
             .weak
             .compare_exchange(1, usize::MAX, Acquire, Relaxed)
             .is_ok()
         {
-            // This needs to be an `Acquire` to synchronize with the decrement of the `strong`
-            // counter in `drop` -- the only access that happens when any but the last reference
-            // is being dropped.
             let unique = this.inner().strong.load(Acquire) == 1;
-
-            // The release write here synchronizes with a read in `downgrade`,
-            // effectively preventing the above read of `strong` from happening
-            // after the write.
-            this.inner().weak.store(1, Release); // release the lock
+            this.inner().weak.store(1, Release);
             unique
         } else {
             false
@@ -216,7 +215,6 @@ impl<T> Arw<T> {
                 .compare_exchange_weak(cur, cur + 1, Acquire, Relaxed)
             {
                 Ok(_) => {
-                    // Make sure we do not create a dangling Weak
                     debug_assert!(!is_dangling(self.inner()));
                     return WeakArw { ptr: self.ptr };
                 }
@@ -237,8 +235,6 @@ impl<T> Arw<T> {
     #[inline]
     pub fn weak_count(this: &Self) -> usize {
         let cnt = this.inner().weak.load(Relaxed);
-        // If the weak count is currently locked, the value of the
-        // count was 0 just before taking the lock.
         if cnt == usize::MAX { 0 } else { cnt - 1 }
     }
 
@@ -264,14 +260,11 @@ impl<T> Arw<T> {
     pub fn into_raw(self) -> *const T {
         // prevent auto drop
         let this = ManuallyDrop::new(self);
-
         let inner: *mut ArwInner<T> = this.get_mut_inner_ptr();
-
         // Make sure Miri realizes that we transition from a noalias pointer to a raw pointer here.
         let cell_ptr: *const RwLock<T> = unsafe { ptr::addr_of!((*inner).val) };
         let data_ptr: *const T = cell_ptr.cast::<T>();
-
-        data_ptr
+        data_ptr.cast::<T>()
     }
 
     pub unsafe fn from_raw(ptr: *const T) -> Self {
@@ -305,7 +298,6 @@ impl<T> Clone for Arw<T> {
         if self.inner().strong.fetch_add(1, Relaxed) >= MAX_REFCOUNT {
             abort();
         }
-
         unsafe { Self::from_inner_in(self.get_mut_inner_ptr()) }
     }
 }
@@ -355,9 +347,13 @@ where
 
         atomic::fence(Acquire);
 
+        // Create weak to handle deallocation
         let _weak = WeakArw { ptr: self.ptr };
 
-        unsafe { ptr::drop_in_place(&mut (*self.get_mut_inner_ptr()).val) }
+        unsafe {
+            // Now drop the RwLock itself
+            ptr::drop_in_place(ptr::addr_of_mut!((*self.get_mut_inner_ptr()).val))
+        };
     }
 }
 
@@ -398,7 +394,6 @@ impl From<&str> for Arw<String> {
     /// ```
     #[inline]
     fn from(s: &str) -> Self {
-        // copy data to own them
         Arw::new(s.to_string())
     }
 }
@@ -414,20 +409,16 @@ impl<T: 'static> From<Box<T>> for Arw<Box<T>> {
     /// assert_eq!(**a.as_ref(), "hello");
     /// ```
     #[inline]
-    fn from(b: Box<T>) -> Self
-    where
-        T: Sized,
-    {
+    fn from(b: Box<T>) -> Self {
         Arw::new(b)
     }
 }
 
 impl<T> fmt::Debug for Arw<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let inner = self.inner();
         f.debug_struct("Arw")
-            .field("S", &inner.strong)
-            .field("W", &inner.weak)
+            .field("S", &self.inner().strong)
+            .field("W", &self.inner().weak)
             .finish()
     }
 }
