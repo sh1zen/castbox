@@ -114,6 +114,21 @@ mod tests_any_ref {
         assert_eq!(w.strong_count(), 0);
     }
 
+    #[test]
+    fn weak_count_after_strongs_dropped() {
+        let x = AnyRef::new(42);
+        let w1 = x.downgrade();
+        let w2 = w1.clone();
+        // 2 explicit weaks, 1 implicit → weak_count returns 2
+        assert_eq!(w1.weak_count(), 2);
+        drop(x);
+        // strongs dead, 2 explicit weaks → raw count == 2, returns 2
+        assert_eq!(w1.weak_count(), 2);
+        drop(w2);
+        // strongs dead, 1 explicit weak → raw count == 1, returns 1
+        assert_eq!(w1.weak_count(), 1);
+    }
+
     // ==================== is_unique Tests ====================
 
     #[test]

@@ -128,7 +128,8 @@ impl WeakAnyRef {
         unsafe { &*strong_ptr }.load(Relaxed)
     }
 
-    /// Returns the number of weak references.
+    /// Returns the number of weak references (excluding the implicit one
+    /// held collectively by all strong references).
     ///
     /// # Example
     /// ```
@@ -136,10 +137,10 @@ impl WeakAnyRef {
     /// let a = AnyRef::new(1);
     /// let w1 = a.downgrade();
     /// let w2 = w1.clone();
-    /// assert_eq!(w2.weak_count(), 2); // includes implicit
+    /// assert_eq!(w2.weak_count(), 2); // 2 explicit weak references (implicit excluded)
     /// ```
     pub fn weak_count(&self) -> usize {
-        // Access only the atomic field via raw pointer to avoid data races
+        // Access only the atomic fields via raw pointer to avoid data races
         let ptr = self.ptr;
         if is_dangling(ptr) {
             return 0;
@@ -147,10 +148,17 @@ impl WeakAnyRef {
 
         let inner_ptr = ptr as *mut AnyRefInner;
         let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
-        let count = unsafe { &*weak_ptr }.load(Relaxed);
+        let strong_ptr = unsafe { ptr::addr_of!((*inner_ptr).strong) };
+        let weak_count = unsafe { &*weak_ptr }.load(Relaxed);
+        let strong_count = unsafe { &*strong_ptr }.load(Relaxed);
 
-        // Subtract 1 for the implicit weak reference held by strong refs
-        if count > 0 { count - 1 } else { 0 }
+        // While any strong reference is alive there is one implicit weak reference.
+        // Subtract it so that the return value reflects only explicit weak references.
+        if strong_count > 0 && weak_count > 0 {
+            weak_count - 1
+        } else {
+            weak_count
+        }
     }
 }
 

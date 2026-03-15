@@ -36,9 +36,9 @@ impl<T> WeakArw<T> {
             return None;
         }
 
-        // SAFETY: Accediamo SOLO al campo `strong` usando ptr::addr_of!
-        // senza creare un riferimento all'intero ArwInner.
-        // Questo evita il conflitto di retag con drop_in_place su `val`.
+        // SAFETY: We access ONLY the `strong` field via ptr::addr_of!
+        // without creating a reference to the entire ArwInner.
+        // This avoids retag conflicts with drop_in_place on `val`.
         let strong_ptr: *const AtomicUsize = unsafe { ptr::addr_of!((*self.ptr).strong) };
 
         let mut cur = unsafe { (*strong_ptr).load(Relaxed) };
@@ -50,7 +50,7 @@ impl<T> WeakArw<T> {
 
             assert!(cur <= MAX_REFCOUNT, "INTERNAL OVERFLOW ERROR");
 
-            // SAFETY: strong_ptr punta a un AtomicUsize valido
+            // SAFETY: strong_ptr points to a valid AtomicUsize
             match unsafe { (*strong_ptr).compare_exchange_weak(cur, cur + 1, Acquire, Relaxed) } {
                 Ok(_) => {
                     return unsafe { Some(Arw::from_inner_in(self.ptr as *mut ArwInner<T>)) };
@@ -66,27 +66,38 @@ impl<T> WeakArw<T> {
             return 0;
         }
 
-        // SAFETY: Accesso solo al campo atomico via puntatore raw
+        // SAFETY: Access only the atomic field via raw pointer
         let strong_ptr: *const AtomicUsize = unsafe { ptr::addr_of!((*self.ptr).strong) };
         unsafe { (*strong_ptr).load(Relaxed) }
     }
 
-    /// Returns the number of weak references.
+    /// Returns the number of explicit weak references (excluding the implicit one
+    /// held collectively by all strong references).
     pub fn weak_count(&self) -> usize {
         if is_dangling(self.ptr) {
             return 0;
         }
 
-        // SAFETY: Accesso solo al campo atomico via puntatore raw
+        // SAFETY: Access only the atomic fields via raw pointer
         let weak_ptr: *const AtomicUsize = unsafe { ptr::addr_of!((*self.ptr).weak) };
-        unsafe { (*weak_ptr).load(Relaxed) }
+        let strong_ptr: *const AtomicUsize = unsafe { ptr::addr_of!((*self.ptr).strong) };
+        let weak_count = unsafe { (*weak_ptr).load(Relaxed) };
+        let strong_count = unsafe { (*strong_ptr).load(Relaxed) };
+
+        // While any strong reference is alive there is one implicit weak reference.
+        // Subtract it so that the return value reflects only explicit weak references.
+        if strong_count > 0 && weak_count > 0 {
+            weak_count - 1
+        } else {
+            weak_count
+        }
     }
 }
 
 impl<T> Clone for WeakArw<T> {
     fn clone(&self) -> WeakArw<T> {
         if !is_dangling(self.ptr) {
-            // SAFETY: Accesso solo al campo atomico via puntatore raw
+            // SAFETY: Access only the atomic field via raw pointer
             let weak_ptr: *const AtomicUsize = unsafe { ptr::addr_of!((*self.ptr).weak) };
 
             let old_size = unsafe { (*weak_ptr).fetch_add(1, Relaxed) };
@@ -124,13 +135,13 @@ impl<T> Drop for WeakArw<T> {
             return;
         }
 
-        // SAFETY: Accesso solo al campo atomico via puntatore raw
+        // SAFETY: Access only the atomic field via raw pointer
         let weak_ptr: *const AtomicUsize = unsafe { ptr::addr_of!((*self.ptr).weak) };
 
         if unsafe { (*weak_ptr).fetch_sub(1, Release) } == 1 {
             atomic::fence(Acquire);
 
-            // A questo punto weak == 0, siamo gli unici e possiamo deallocare
+            // At this point weak == 0; we are the sole remaining reference and can deallocate.
             let layout = Layout::new::<ArwInner<T>>();
             unsafe {
                 dealloc(self.ptr as *mut u8, layout);

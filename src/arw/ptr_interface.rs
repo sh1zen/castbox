@@ -32,7 +32,7 @@ where
             let obj = ptr as *const u8;
             let data_offset = offset_of!(ArwInner<T>, val);
 
-            // SAFETY: we assume the dyn Any points to ARWInner.data
+            // SAFETY: we assume the pointer points to ArwInner.val
             unsafe { obj.offset(-(data_offset as isize)) as *mut ArwInner<T> }
         };
 

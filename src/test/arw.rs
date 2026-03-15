@@ -253,6 +253,22 @@ mod tests_arw {
         assert_eq!(weak.weak_count(), 1);
     }
 
+    #[test]
+    fn weak_count_with_strongs_alive() {
+        let x = Arw::new(42i32);
+        let w1 = x.downgrade();
+        // 1 explicit weak, 1 implicit (held by strong) → weak_count returns 1
+        assert_eq!(w1.weak_count(), 1);
+        let w2 = w1.clone();
+        // 2 explicit weaks, 1 implicit → weak_count returns 2
+        assert_eq!(w2.weak_count(), 2);
+        drop(w1);
+        assert_eq!(w2.weak_count(), 1);
+        drop(x);
+        // strongs dead, 1 explicit weak remaining → raw count == 1, returns 1
+        assert_eq!(w2.weak_count(), 1);
+    }
+
     // ==================== Drop Behavior ====================
 
     #[test]
