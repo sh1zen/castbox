@@ -14,7 +14,7 @@ All notable changes to this project will be documented in this file.
 - AnyRef edge cases
 - Arw edge cases
 
-## [0.1.0] - 2025-11-04
+## [0.1.2] - 2025-11-04
 
 ### Added
 
