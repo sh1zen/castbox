@@ -2,24 +2,52 @@ use crate::anyref::inner::{AnyRefInner, MAX_REFCOUNT};
 use crate::anyref::ptr_interface::PtrInterface;
 use crate::anyref::strong::AnyRef;
 use crate::utils::is_dangling;
-use std::alloc::{dealloc, Layout};
+use std::alloc::{Layout, dealloc};
 use std::num::NonZeroUsize;
 use std::process::abort;
 use std::ptr;
 use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
+/// A non-owning handle to an [`AnyRef`] allocation.
+///
+/// A weak handle retains reference-counting storage without keeping the value
+/// alive. [`Self::upgrade`] creates a strong handle while the value is alive,
+/// or returns `None` after the last strong handle has been dropped. Empty handles
+/// created with [`Self::new`] or `Default::default()` never upgrade.
 #[repr(transparent)]
 pub struct WeakAnyRef {
     pub(crate) ptr: *const AnyRefInner,
 }
 
+// Keeps the allocation alive during payload destruction without contributing
+// to the public count of explicit weak references.
+pub(crate) struct ImplicitWeak {
+    pub(crate) ptr: *const AnyRefInner,
+}
+
+impl Drop for ImplicitWeak {
+    fn drop(&mut self) {
+        unsafe { release_weak(self.ptr) };
+    }
+}
+
+unsafe fn release_weak(ptr: *const AnyRefInner) {
+    let weak = unsafe { &*ptr::addr_of!((*ptr).weak) };
+    if weak.fetch_sub(1, Release) == 1 {
+        atomic::fence(Acquire);
+        unsafe { dealloc(ptr.cast_mut().cast(), Layout::new::<AnyRefInner>()) };
+    }
+}
+
+// SAFETY: Upgrading can only recover payloads inserted with Send + Sync bounds.
+// Weak handles otherwise access only the atomic allocation counters.
 unsafe impl Send for WeakAnyRef {}
 unsafe impl Sync for WeakAnyRef {}
 
 impl WeakAnyRef {
     /// Constructs a new `WeakAnyRef`, without allocating any memory.
-    /// Calling [`upgrade`] on the return value always gives [`None`].
+    /// Calling [`Self::upgrade`] on the return value always gives [`None`].
     ///
     /// ```
     /// use castbox::WeakAnyRef;
@@ -35,6 +63,7 @@ impl WeakAnyRef {
 
     /// Attempts to upgrade the weak reference to a strong one.
     /// Returns `None` if the value has been dropped.
+    /// A successful upgrade increments the strong count and keeps the value alive.
     ///
     /// # Example
     /// ```
@@ -61,53 +90,21 @@ impl WeakAnyRef {
         let strong_ptr = unsafe { ptr::addr_of!((*inner_ptr).strong) };
         let strong_atomic = unsafe { &*strong_ptr };
 
-        #[inline]
-        fn checked_increment(n: usize) -> Option<usize> {
-            if n == 0 {
+        let mut count = strong_atomic.load(Relaxed);
+        loop {
+            if count == 0 {
                 return None;
             }
-            assert!(n <= MAX_REFCOUNT, "INTERNAL OVERFLOW ERROR");
-            Some(n + 1)
-        }
-
-        // We use a CAS loop to increment the strong count instead of a
-        // fetch_add as this function should never take the reference count
-        // from zero to one.
-        //
-        // Acquire ordering synchronizes with the Release in AnyRef::drop's fetch_sub,
-        // ensuring we see all writes to the data before the strong count
-        // was decremented to 0. If strong is 0, the CAS fails and we return None.
-        if strong_atomic
-            .fetch_update(Acquire, Relaxed, checked_increment)
-            .is_ok()
-        {
-            // SAFETY: The strong count was > 0 and we've incremented it,
-            // so the data is still alive.
-            unsafe { Some(AnyRef::from_inner_in(self.get_mut_inner_ptr())) }
-        } else {
-            None
-        }
-    }
-
-    /// Returns a reference to the inner `AnyRefInner` if the pointer is not dangling.
-    ///
-    /// # Safety Note
-    /// This should only be used to access atomic fields (strong, weak counts).
-    /// The data field may be in the process of being dropped if strong count is 0.
-    #[inline]
-    fn inner(&self) -> Option<&AnyRefInner> {
-        let ptr = self.ptr;
-        if is_dangling(ptr) {
-            None
-        } else {
-            // SAFETY: If not dangling and we hold a weak ref, the AnyRefInner
-            // struct itself is still allocated (only deallocated when weak count hits 0).
-            // Callers must only access atomic fields (strong, weak).
-            Some(unsafe { &*ptr })
+            assert!(count < MAX_REFCOUNT, "INTERNAL OVERFLOW ERROR");
+            match strong_atomic.compare_exchange_weak(count, count + 1, Acquire, Relaxed) {
+                Ok(_) => return unsafe { Some(AnyRef::from_inner_in(self.get_mut_inner_ptr())) },
+                Err(current) => count = current,
+            }
         }
     }
 
     /// Returns the number of strong references.
+    /// Empty handles report zero. The count can change immediately on another thread.
     ///
     /// # Example
     /// ```
@@ -128,7 +125,9 @@ impl WeakAnyRef {
         unsafe { &*strong_ptr }.load(Relaxed)
     }
 
-    /// Returns the number of weak references.
+    /// Returns the number of explicit weak references, excluding the implicit one.
+    /// This is an estimate when other threads are cloning or dropping references.
+    /// Empty handles report zero; allocated handles include themselves in the count.
     ///
     /// # Example
     /// ```
@@ -136,7 +135,7 @@ impl WeakAnyRef {
     /// let a = AnyRef::new(1);
     /// let w1 = a.downgrade();
     /// let w2 = w1.clone();
-    /// assert_eq!(w2.weak_count(), 2); // includes implicit
+    /// assert_eq!(w2.weak_count(), 2);
     /// ```
     pub fn weak_count(&self) -> usize {
         // Access only the atomic field via raw pointer to avoid data races
@@ -146,11 +145,8 @@ impl WeakAnyRef {
         }
 
         let inner_ptr = ptr as *mut AnyRefInner;
-        let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
-        let count = unsafe { &*weak_ptr }.load(Relaxed);
-
-        // Subtract 1 for the implicit weak reference held by strong refs
-        if count > 0 { count - 1 } else { 0 }
+        let count_ptr = unsafe { ptr::addr_of!((*inner_ptr).explicit_weak) };
+        unsafe { &*count_ptr }.load(Relaxed)
     }
 }
 
@@ -178,6 +174,8 @@ impl Clone for WeakAnyRef {
             if old_size > MAX_REFCOUNT {
                 abort();
             }
+            let count_ptr = unsafe { ptr::addr_of!((*inner_ptr).explicit_weak) };
+            unsafe { &*count_ptr }.fetch_add(1, Relaxed);
         }
 
         Self { ptr: self.ptr }
@@ -185,8 +183,8 @@ impl Clone for WeakAnyRef {
 }
 
 impl Default for WeakAnyRef {
-    /// Constructs a new `Weak<T>`, without allocating memory.
-    /// Calling [`upgrade`] on the return value always
+    /// Constructs an empty `WeakAnyRef`, without allocating memory.
+    /// Calling [`WeakAnyRef::upgrade`] on the return value always
     /// gives [`None`].
     ///
     /// ```
@@ -222,21 +220,8 @@ impl Drop for WeakAnyRef {
             return;
         }
 
-        // Access only the atomic field via raw pointer
-        let inner_ptr = ptr as *mut AnyRefInner;
-        let weak_ptr = unsafe { ptr::addr_of!((*inner_ptr).weak) };
-        let weak_atomic = unsafe { &*weak_ptr };
-
-        if weak_atomic.fetch_sub(1, Release) == 1 {
-            // We were the last weak reference, deallocate the AnyRefInner
-            atomic::fence(Acquire);
-
-            let layout = Layout::new::<AnyRefInner>();
-            let ptr = self.ptr as *mut u8;
-
-            unsafe {
-                dealloc(ptr, layout);
-            }
-        }
+        let count_ptr = unsafe { ptr::addr_of!((*ptr).explicit_weak) };
+        unsafe { &*count_ptr }.fetch_sub(1, Relaxed);
+        unsafe { release_weak(ptr) };
     }
 }

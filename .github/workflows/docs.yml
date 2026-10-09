@@ -29,11 +29,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-            toolchain: stable
+        uses: dtolnay/rust-toolchain@stable
       - name: Build documentation
-        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
 
       # NEW STEP: Create the redirect page
       - name: Create redirect page

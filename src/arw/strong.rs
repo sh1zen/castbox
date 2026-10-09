@@ -1,17 +1,27 @@
+use crate::arw::WeakArw;
 use crate::arw::inner::{ArwInner, MAX_REFCOUNT};
 use crate::arw::ptr_interface::PtrInterface;
-use crate::arw::WeakArw;
+use crate::arw::weak::ImplicitWeak;
 use crate::utils::is_dangling;
 use crossync::sync::{RwLock, WatchGuardMut, WatchGuardRef};
 use std::any::Any;
 use std::mem::ManuallyDrop;
-use std::ops::Deref;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::process::abort;
 use std::sync::atomic;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use std::{fmt, hint, ptr};
 
+/// A reference-counted pointer with read-write locking for a value of type `T`.
+///
+/// Clones share the same value and allocation. [`Self::as_ref`] returns a
+/// [`WatchGuardRef`] for shared access; [`Self::as_mut`] returns a
+/// [`WatchGuardMut`] for exclusive access. Each guard holds its lock until dropped.
+///
+/// `Arw<T>` implements [`Send`] and [`Sync`] when `T` implements both traits.
+/// Values without these bounds can be stored for use within one thread.
+/// Release guards before requesting conflicting access through any clone;
+/// nested access can deadlock. See [`crate::AnyRef`] for runtime type erasure.
 #[repr(transparent)]
 pub struct Arw<T: Sized> {
     ptr: *const ArwInner<T>,
@@ -25,6 +35,8 @@ impl<T: Sized> RefUnwindSafe for Arw<T> {}
 
 impl<T> Arw<T> {
     /// Creates a new `Arw` containing the given value.
+    /// The value must be `'static`; it need not implement `Send` or `Sync`
+    /// unless the pointer is shared across threads.
     ///
     /// # Example
     /// ```
@@ -39,7 +51,10 @@ impl<T> Arw<T> {
         unsafe { Self::from_inner(Box::leak(Box::new(ArwInner::new(value)))) }
     }
 
-    /// Attempts to extract the inner value if there is exactly one strong reference.
+    /// Attempts to extract the inner value if there is exactly one strong
+    /// reference and no explicit weak references.
+    /// Returns the original handle in `Err` when either condition is unmet.
+    /// Existing weak handles must be dropped before extraction can succeed.
     ///
     /// # Example
     /// ```
@@ -52,23 +67,23 @@ impl<T> Arw<T> {
     where
         T: 'static,
     {
-        // Try to transition strong 1 -> 0 to become sole strong owner.
+        // Lock out downgrades and reject existing weak references before touching
+        // the strong count. Failed unwraps must not appear dead to weak handles.
         if this
             .inner()
-            .strong
-            .compare_exchange(1, 0, Acquire, Relaxed)
+            .weak
+            .compare_exchange(1, usize::MAX, Acquire, Relaxed)
             .is_err()
         {
             return Err(this);
         }
-
-        // synchronize with any release operations
-        atomic::fence(Acquire);
-
-        // Check weak count. If it's not the implicit weak (1), restore and return Err.
-        let weak_count = this.inner().weak.load(Relaxed);
-        if weak_count != 1 {
-            this.inner().strong.store(1, Release);
+        let sole_owner = this
+            .inner()
+            .strong
+            .compare_exchange(1, 0, Acquire, Relaxed)
+            .is_ok();
+        this.inner().weak.store(1, Release);
+        if !sole_owner {
             return Err(this);
         }
 
@@ -113,6 +128,11 @@ impl<T> Arw<T> {
         unsafe { &*self.ptr }
     }
 
+    /// Consumes this handle and maps a read-locked value into a new allocation.
+    ///
+    /// Other owners of the original allocation retain their value. The closure
+    /// receives `&T` while the read lock is held; it must not request write access
+    /// to the original allocation.
     pub fn map<U: 'static, F>(self, func: F) -> Arw<U>
     where
         T: Any,
@@ -122,8 +142,10 @@ impl<T> Arw<T> {
         Arw::new(func(&*guard))
     }
 
-    /// Returns a reference to the inner value of type `T`.
-    /// Panics if the type does not match `T`.
+    /// Waits for a read lock and returns a guard to the value.
+    ///
+    /// Other read guards may coexist. Drop the guard before requesting write
+    /// access through this pointer or a clone.
     ///
     /// # Example
     /// ```
@@ -136,8 +158,10 @@ impl<T> Arw<T> {
         self.inner().val.lock_shared()
     }
 
-    /// Returns a mutable reference to the inner value of type `T`.
-    /// Panics if the type does not match `T`.
+    /// Waits for a write lock and returns a guard for exclusive value access.
+    ///
+    /// Drop the guard before requesting further value access through this
+    /// pointer or any clone.
     ///
     /// # Example
     /// ```
@@ -153,7 +177,11 @@ impl<T> Arw<T> {
         self.inner().val.lock_exclusive()
     }
 
-    /// Returns `true` if the `Arw` is the only strong reference to the value.
+    /// Checks for one strong reference and no explicit weak references.
+    ///
+    /// The result does not reserve ownership and can change immediately if
+    /// other threads create or drop handles. Use [`Self::try_unwrap`] to extract
+    /// a value after checking ownership atomically.
     ///
     /// # Example
     /// ```
@@ -178,7 +206,11 @@ impl<T> Arw<T> {
         }
     }
 
-    /// Convert into a weak reference
+    /// Creates a weak handle without consuming this strong reference.
+    ///
+    /// The weak handle retains reference-counting storage, but does not keep
+    /// the value alive. See [`WeakArw::upgrade`].
+    ///
     /// # Example
     ///
     /// ```
@@ -215,6 +247,7 @@ impl<T> Arw<T> {
                 .compare_exchange_weak(cur, cur + 1, Acquire, Relaxed)
             {
                 Ok(_) => {
+                    self.inner().explicit_weak.fetch_add(1, Relaxed);
                     debug_assert!(!is_dangling(self.inner()));
                     return WeakArw { ptr: self.ptr };
                 }
@@ -224,6 +257,7 @@ impl<T> Arw<T> {
     }
 
     /// Returns the number of weak references (excluding the implicit one).
+    /// This count may change immediately when other threads create or drop handles.
     ///
     /// # Example
     /// ```
@@ -234,11 +268,11 @@ impl<T> Arw<T> {
     /// ```
     #[inline]
     pub fn weak_count(this: &Self) -> usize {
-        let cnt = this.inner().weak.load(Relaxed);
-        if cnt == usize::MAX { 0 } else { cnt - 1 }
+        this.inner().explicit_weak.load(Relaxed)
     }
 
     /// Returns the number of strong references.
+    /// This count may change immediately when other threads clone or drop handles.
     ///
     /// # Example
     /// ```
@@ -252,23 +286,29 @@ impl<T> Arw<T> {
         this.inner().strong.load(Relaxed)
     }
 
+    /// Returns whether both handles refer to the same allocation.
+    ///
+    /// This compares pointer identity without locking or comparing the values.
     #[inline]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         ptr::addr_eq(this.get_mut_inner_ptr(), other.get_mut_inner_ptr())
     }
 
-    pub fn into_raw(self) -> *const T {
-        // prevent auto drop
+    /// Converts this strong reference into an opaque ownership pointer.
+    /// It must only be passed to `Arw::<T>::from_raw`; it is not a payload pointer.
+    /// The strong count is unchanged. Failing to restore the handle leaks its ownership.
+    pub fn into_raw(self) -> *const () {
         let this = ManuallyDrop::new(self);
-        let inner: *mut ArwInner<T> = this.get_mut_inner_ptr();
-        // Make sure Miri realizes that we transition from a noalias pointer to a raw pointer here.
-        let cell_ptr: *const RwLock<T> = unsafe { ptr::addr_of!((*inner).val) };
-        let data_ptr: *const T = cell_ptr.cast::<T>();
-        data_ptr.cast::<T>()
+        this.ptr.cast()
     }
 
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
-        unsafe { Self::from_raw_in(ptr) }
+    /// Restores a strong reference converted with `Arw::<T>::into_raw`.
+    ///
+    /// # Safety
+    /// `ptr` must be an unconsumed pointer returned by `Arw::<T>::into_raw`
+    /// for exactly the same `T`. Each ownership pointer must be restored once.
+    pub unsafe fn from_raw(ptr: *const ()) -> Self {
+        unsafe { Self::from_inner_in(ptr.cast_mut().cast()) }
     }
 }
 
@@ -303,6 +343,7 @@ impl<T> Clone for Arw<T> {
 }
 
 impl<T: Default> Default for Arw<T> {
+    /// Creates an `Arw<T>` containing `T::default()`.
     fn default() -> Arw<T> {
         unsafe {
             Self::from_inner(Box::leak(Box::write(
@@ -316,6 +357,11 @@ impl<T: Default> Default for Arw<T> {
 impl<T: Sized> Arw<T> {
     /// Replaces the inner value with a new value of type `T`.
     ///
+    /// Consumes and returns this handle while preserving allocation identity.
+    /// All clones observe the replacement. Waits for exclusive access and drops
+    /// the previous value after releasing the lock. If that destructor panics,
+    /// surviving clones retain the new value.
+    ///
     /// # Example
     /// ```
     /// use castbox::Arw;
@@ -324,11 +370,11 @@ impl<T: Sized> Arw<T> {
     /// assert_eq!(a.as_ref(), 123);
     /// ```
     pub fn fill(this: Self, value: T) -> Self {
-        let ptr: *mut ArwInner<T> = this.get_mut_inner_ptr();
-        let ref_inner = unsafe { &mut *ptr };
-        let mut wd = ref_inner.val.lock_exclusive();
-        *wd = value;
-        drop(wd);
+        let old = {
+            let mut wd = this.inner().val.lock_exclusive();
+            std::mem::replace(&mut *wd, value)
+        };
+        drop(old);
         this
     }
 }
@@ -348,7 +394,7 @@ where
         atomic::fence(Acquire);
 
         // Create weak to handle deallocation
-        let _weak = WeakArw { ptr: self.ptr };
+        let _weak = ImplicitWeak { ptr: self.ptr };
 
         unsafe {
             // Now drop the RwLock itself
@@ -357,34 +403,44 @@ where
     }
 }
 
-impl<T: Sized + 'static> From<*mut T> for Arw<T> {
-    /// Creates a new `Arw` taking posses over the pointed value `*mut T`.
+impl<T: 'static> Arw<T> {
+    /// Takes ownership of an initialized value and its `Box`-compatible allocation.
+    ///
+    /// This accepts a payload pointer, not an ownership pointer produced by
+    /// [`Self::into_raw`]. Prefer [`Self::new`] when possible.
     ///
     /// # Safety
-    /// - `ptr` must be valid and pointing to a dynamically allocated instance of T
-    ///   (ex. `Box::into_raw`).
-    /// - After Arw will own `ptr` and no other reference to ptr should be used.
+    /// `ptr` must be a valid, unconsumed pointer returned by `Box::into_raw`
+    /// or `create_raw_pointer` for the same `T`. This call takes exclusive
+    /// ownership of both the value and its allocation; do not access or free it again.
     ///
     /// # Example
     /// ```
-    /// use castbox::utils::{create_raw_pointer, dealloc_layout};
+    /// use castbox::utils::create_raw_pointer;
     /// use castbox::Arw;
     /// let raw = create_raw_pointer(String::from("hello"));
-    /// let a = Arw::from(raw);
+    /// let a = unsafe { Arw::from_owned_raw(raw) };
     /// a.as_mut().push_str(":1");
-    /// dealloc_layout(raw);
     /// assert_eq!(a.as_ref(), "hello:1");
     /// ```
+    ///
+    /// ```compile_fail
+    /// let raw = castbox::utils::create_raw_pointer(42);
+    /// castbox::Arw::from_owned_raw(raw); // requires an unsafe block
+    /// ```
+    ///
+    /// ```compile_fail
+    /// castbox::Arw::from(std::ptr::null_mut::<i32>()); // no safe pointer conversion
+    /// ```
     #[inline]
-    fn from(ptr: *mut T) -> Self {
-        assert!(!ptr.is_null(), "pointer must not be null");
-        let value = unsafe { ptr::read(ptr) };
-        Arw::new(value)
+    pub unsafe fn from_owned_raw(ptr: *mut T) -> Self {
+        // SAFETY: The caller transfers a Box-compatible allocation and its value.
+        Arw::new(*unsafe { Box::from_raw(ptr) })
     }
 }
 
 impl From<&str> for Arw<String> {
-    /// Creates a new `Arw` from a `*const T`.
+    /// Copies a string slice into a new `Arw<String>`.
     ///
     /// # Example
     /// ```
@@ -399,7 +455,9 @@ impl From<&str> for Arw<String> {
 }
 
 impl<T: 'static> From<Box<T>> for Arw<Box<T>> {
-    /// Creates a new `Arw` from a `Box<T>`.
+    /// Stores a box as the value of a new `Arw<Box<T>>`.
+    ///
+    /// The box is retained as the payload. To store `T` directly, use `Arw::new(*boxed)`.
     ///
     /// # Example
     /// ```
@@ -425,6 +483,6 @@ impl<T> fmt::Debug for Arw<T> {
 
 impl<T> fmt::Pointer for Arw<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&self.inner().val.lock_shared().deref(), f)
+        fmt::Pointer::fmt(&self.ptr, f)
     }
 }

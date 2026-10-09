@@ -10,6 +10,7 @@ pub(crate) const MAX_REFCOUNT: usize = isize::MAX as usize;
 pub(crate) struct ArwInner<T: Sized> {
     pub(crate) strong: AtomicUsize,
     pub(crate) weak: AtomicUsize,
+    pub(crate) explicit_weak: AtomicUsize,
     marker: PhantomData<T>,
     pub(crate) val: RwLock<T>,
 }
@@ -24,6 +25,7 @@ impl<T> ArwInner<T> {
             val: RwLock::new(val),
             strong: AtomicUsize::new(1),
             weak: AtomicUsize::new(1),
+            explicit_weak: AtomicUsize::new(0),
             marker: PhantomData,
         }
     }
@@ -35,6 +37,7 @@ impl<T: Default> Default for ArwInner<T> {
             val: RwLock::new(Default::default()),
             strong: AtomicUsize::new(1),
             weak: AtomicUsize::new(1),
+            explicit_weak: AtomicUsize::new(0),
             marker: PhantomData,
         }
     }

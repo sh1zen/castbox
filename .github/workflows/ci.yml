@@ -2,7 +2,7 @@
 name: Rust CI
 
 # This section defines when the workflow will run.
-# It will trigger on any `push` to any branch, and on any `pull_request`.
+# It runs on pushes and pull requests targeting main.
 on:
   push:
     branches: [ "main" ]
@@ -30,6 +30,11 @@ jobs:
     # 1. Check out the repository code so the workflow can access it
     - uses: actions/checkout@v4
 
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
     # 2. Cache the cargo directories to speed up future builds
     - name: Cache cargo dependencies
       uses: actions/cache@v4
@@ -43,18 +48,22 @@ jobs:
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     # 3. Check that the code is formatted correctly
-    # - name: Check formatting
-    #  run: cargo fmt -- --check
+    - name: Check formatting
+      run: cargo fmt --all -- --check
 
     # 4. Run Clippy to check for common mistakes and enforce idiomatic Rust
     #    The `-D warnings` flag treats all warnings as errors, failing the build.
-    # - name: Run Clippy
-    #  run: cargo clippy
+    - name: Run Clippy
+      run: cargo clippy --locked --all-targets -- -D warnings
 
     # 5. Run the tests (if any are defined)
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked --verbose
+
+    - name: Test workflow scripts
+      if: runner.os == 'Linux'
+      run: python3 -m unittest discover -s tests -p 'test_workflows.py' -v
 
     # 6. Build the project in release mode to ensure it compiles
     - name: Build
-      run: cargo build --release --verbose
+      run: cargo build --locked --release --verbose

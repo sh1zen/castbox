@@ -1,7 +1,7 @@
 mod inner;
 mod ptr_interface;
-mod weak;
 mod strong;
+mod weak;
 
-pub use weak::WeakAnyRef;
 pub use strong::AnyRef;
+pub use weak::WeakAnyRef;

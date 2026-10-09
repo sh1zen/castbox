@@ -11,11 +11,11 @@ mod tests_arw {
     #[test]
     fn new_with_primitive_types() {
         let i32_ref = Arw::new(42i32);
-        let f64_ref = Arw::new(3.14f64);
+        let f64_ref = Arw::new(3.5f64);
         let bool_ref = Arw::new(true);
 
         assert_eq!(*i32_ref.as_ref(), 42i32);
-        assert!((*f64_ref.as_ref() - 3.14f64).abs() < f64::EPSILON);
+        assert!((*f64_ref.as_ref() - 3.5f64).abs() < f64::EPSILON);
         assert!(*bool_ref.as_ref());
     }
 
@@ -31,10 +31,10 @@ mod tests_arw {
     #[test]
     fn new_with_zero_sized_type() {
         #[derive(Debug, PartialEq)]
-        struct ZST;
+        struct Zst;
 
-        let zst_ref = Arw::new(ZST);
-        assert_eq!(*zst_ref.as_ref(), ZST);
+        let zst_ref = Arw::new(Zst);
+        assert_eq!(*zst_ref.as_ref(), Zst);
         assert_eq!(Arw::strong_count(&zst_ref), 1);
     }
 
@@ -216,7 +216,7 @@ mod tests_arw {
     fn into_raw_from_raw_roundtrip() {
         let x = Arw::new(String::from("test"));
         let raw = Arw::into_raw(x);
-        let y = unsafe { Arw::from_raw(raw) };
+        let y = unsafe { Arw::<String>::from_raw(raw) };
         assert_eq!(*y.as_ref(), "test");
     }
 

@@ -19,3 +19,6 @@ Cargo.lock
 
 # Powershell
 *.ps1
+
+# Python workflow test cache
+__pycache__/

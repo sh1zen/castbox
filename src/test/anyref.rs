@@ -13,12 +13,12 @@ mod tests_any_ref {
     #[test]
     fn new_with_primitive_types() {
         let i32_ref = AnyRef::new(42i32);
-        let f64_ref = AnyRef::new(3.14f64);
+        let f64_ref = AnyRef::new(3.5f64);
         let bool_ref = AnyRef::new(true);
         let char_ref = AnyRef::new('x');
 
         assert_eq!(*i32_ref.as_ref::<i32>(), 42i32);
-        assert!((f64_ref.as_ref::<f64>().clone() - 3.14f64).abs() < f64::EPSILON);
+        assert!((*f64_ref.as_ref::<f64>() - 3.5f64).abs() < f64::EPSILON);
         assert!(*bool_ref.as_ref::<bool>());
         assert_eq!(*char_ref.as_ref::<char>(), 'x');
     }
@@ -37,9 +37,9 @@ mod tests_any_ref {
     #[test]
     fn new_with_zero_sized_type() {
         #[derive(Debug, PartialEq)]
-        struct ZST;
-        let zst_ref = AnyRef::new(ZST);
-        assert_eq!(*zst_ref.as_ref::<ZST>(), ZST);
+        struct Zst;
+        let zst_ref = AnyRef::new(Zst);
+        assert_eq!(*zst_ref.as_ref::<Zst>(), Zst);
     }
 
     // ==================== Type Checking Tests ====================
@@ -47,8 +47,9 @@ mod tests_any_ref {
     #[test]
     fn type_id_is_correct() {
         let x = AnyRef::new(42u32);
-        assert_eq!(x.inner().type_id, TypeId::of::<u32>());
-        assert_ne!(x.inner().type_id, TypeId::of::<i32>());
+        let guard = x.inner().data.lock_shared();
+        assert_eq!((**guard).type_id(), TypeId::of::<u32>());
+        assert_ne!((**guard).type_id(), TypeId::of::<i32>());
     }
 
     #[test]

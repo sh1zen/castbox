@@ -22,20 +22,15 @@ jobs:
       # 2. Create clean source archives (ZIP + TAR.GZ)
       - name: Create source archives
         run: |
-          echo "Cleaning and creating source archives..."
-          zip -r "source-${GITHUB_REF_NAME}.zip" . \
-            -x '*.git*' \
-               'node_modules/*' \
-               '__pycache__/*' \
-               '*.DS_Store' \
-               '*.log'
-
-          tar --exclude-vcs \
-              --exclude='node_modules' \
-              --exclude='__pycache__' \
-              --exclude='*.log' \
-              --exclude='.DS_Store' \
-              -czf "source-${GITHUB_REF_NAME}.tar.gz" . || true
+          set -euo pipefail
+          safe_ref="${GITHUB_REF_NAME//[^a-zA-Z0-9._-]/_}"
+          archive_prefix="source-${safe_ref}"
+          archive_dir="$(mktemp -d)"
+          echo "Creating source archives for ${GITHUB_REF_NAME}..."
+          git archive --format=zip --output="${archive_dir}/${archive_prefix}.zip" HEAD
+          git archive --format=tar.gz --output="${archive_dir}/${archive_prefix}.tar.gz" HEAD
+          printf 'ARCHIVE_DIR=%s\nARCHIVE_PREFIX=%s\n' \
+            "$archive_dir" "$archive_prefix" >> "$GITHUB_ENV"
 
       # 3. Prepare release notes
       - name: Prepare release notes
@@ -64,27 +59,35 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           REPO="${{ github.repository }}"
+          # Stable version tags may include build metadata; branches and RC tags remain prereleases.
+          prerelease=true
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.-]+)?$ ]]; then
+            prerelease=false
+          fi
 
           echo "Checking if release '${TAG}' already exists..."
 
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "Release '${TAG}' already exists — updating assets..."
+            gh release edit "$TAG" --repo "$REPO" --prerelease="$prerelease"
           else
             echo "Creating new draft release for ${TAG}..."
             gh release create "$TAG" \
               --repo "$REPO" \
+              --target "$GITHUB_SHA" \
               --title "$TAG" \
               --notes-file RELEASE_BODY.md \
               --draft \
-              --prerelease
+              --prerelease="$prerelease"
           fi
 
           echo "Uploading assets..."
           gh release upload "$TAG" \
-            "source-${TAG}.zip" \
-            "source-${TAG}.tar.gz" \
+            "${ARCHIVE_DIR}/${ARCHIVE_PREFIX}.zip" \
+            "${ARCHIVE_DIR}/${ARCHIVE_PREFIX}.tar.gz" \
             --repo "$REPO" \
             --clobber
 
